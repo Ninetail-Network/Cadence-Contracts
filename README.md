@@ -58,11 +58,9 @@ It stores **cryptographic hashes of documents** and enables:
 
 ## 🗂️ Data Model
 
-```
-DocumentHash → DocumentRecord
-```
 
----
+DocumentHash → DocumentRecord
+
 
 ## 🔐 Security
 
