@@ -128,7 +128,7 @@ impl ProofStellContract {
         record
     }
 }
-
+// test
 #[cfg(test)]
 mod tests {
     extern crate std;
