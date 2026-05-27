@@ -75,24 +75,67 @@ impl ProofStellContract {
         record
     }
 
-    pub fn get_document(env: Env, document_hash: BytesN<32>) -> Option<DocumentRecord> {
-        let key = DataKey::Document(document_hash);
+/// Retrieves a document record by its hash from persistent storage.
+///
+/// # Arguments
+/// * `env` - The Soroban environment
+/// * `document_hash` - 32-byte hash identifying the document
+///
+/// # Returns
+/// `Some(DocumentRecord)` if found, `None` otherwise
+pub fn get_document(env: Env, document_hash: BytesN<32>) -> Option<DocumentRecord> {
+    let key = DataKey::Document(document_hash);
+    env.storage().persistent().get(&key)
+}
 
-        env.storage().persistent().get(&key)
-    }
+/// Checks whether a document exists and is currently active.
+///
+/// # Arguments
+/// * `env` - The Soroban environment
+/// * `document_hash` - 32-byte hash identifying the document
+///
+/// # Returns
+/// `true` only if the document exists and has `DocumentStatus::Active`
+pub fn verify_document(env: Env, document_hash: BytesN<32>) -> bool {
+    let key = DataKey::Document(document_hash);
+    env.storage()
+        .persistent()
+        .get::<DataKey, DocumentRecord>(&key)
+        .map_or(false, |record| record.status == DocumentStatus::Active)
+}
 
-    pub fn verify_document(env: Env, document_hash: BytesN<32>) -> bool {
-        let key = DataKey::Document(document_hash);
-        let record: Option<DocumentRecord> = env.storage().persistent().get(&key);
+/// Returns the status of a document, or an error if it does not exist.
+///
+/// # Arguments
+/// * `env` - The Soroban environment
+/// * `document_hash` - 32-byte hash identifying the document
+///
+/// # Errors
+/// Returns `ContractError::DocumentNotFound` if no record exists for the given hash
+pub fn get_document_status(
+    env: Env,
+    document_hash: BytesN<32>,
+) -> Result<DocumentStatus, ContractError> {
+    let key = DataKey::Document(document_hash);
+    env.storage()
+        .persistent()
+        .get::<DataKey, DocumentRecord>(&key)
+        .map(|record| record.status)
+        .ok_or(ContractError::DocumentNotFound)
+}
 
-        matches!(
-            record,
-            Some(DocumentRecord {
-                status: DocumentStatus::Active,
-                ..
-            })
-        )
-    }
+/// Checks whether a document exists in storage, regardless of its status.
+///
+/// # Arguments
+/// * `env` - The Soroban environment
+/// * `document_hash` - 32-byte hash identifying the document
+///
+/// # Returns
+/// `true` if any record (active or not) is stored under this hash
+pub fn document_exists(env: Env, document_hash: BytesN<32>) -> bool {
+    let key = DataKey::Document(document_hash);
+    env.storage().persistent().has(&key)
+}
 
     pub fn revoke_document(
         env: Env,
@@ -128,6 +171,7 @@ impl ProofStellContract {
         record
     }
 }
+
 // test
 #[cfg(test)]
 mod tests {
