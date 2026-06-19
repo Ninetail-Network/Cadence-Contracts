@@ -4,7 +4,6 @@
 pub mod error;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod event;
-
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
 };

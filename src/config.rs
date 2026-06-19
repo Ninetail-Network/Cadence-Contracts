@@ -1,9 +1,10 @@
-use std::env;
+use std::{env, fmt};
 
 use thiserror::Error;
+use stellar_strkey::ed25519::PrivateKey;
 use url::Url;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppConfig {
     pub port: u16,
     pub stellar_horizon_url: String,
@@ -16,6 +17,30 @@ pub struct AppConfig {
     pub webhook_urls: Vec<String>,
     pub webhook_secret: Option<String>,
     pub cache_verification_ttl: u64,
+}
+
+impl fmt::Debug for AppConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppConfig")
+            .field("port", &self.port)
+            .field("stellar_horizon_url", &self.stellar_horizon_url)
+            .field(
+                "stellar_secret_key",
+                &self.stellar_secret_key.as_deref().map(|_| "<redacted>"),
+            )
+            .field("redis_url", &self.redis_url)
+            .field("rate_limit_per_second", &self.rate_limit_per_second)
+            .field("rate_limit_burst", &self.rate_limit_burst)
+            .field("stellar_max_retries", &self.stellar_max_retries)
+            .field("log_level", &self.log_level)
+            .field("webhook_urls", &self.webhook_urls)
+            .field(
+                "webhook_secret",
+                &self.webhook_secret.as_deref().map(|_| "<redacted>"),
+            )
+            .field("cache_verification_ttl", &self.cache_verification_ttl)
+            .finish()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -43,10 +68,9 @@ impl AppConfig {
 
         let stellar_secret_key = match env::var("STELLAR_SECRET_KEY") {
             Ok(key) => {
-                // Validate the secret key format (should be 56 chars starting with 'S')
-                if key.len() != 56 || !key.starts_with('S') {
+                if PrivateKey::from_string(&key).is_err() {
                     errors.push(
-                        "STELLAR_SECRET_KEY must be a 56-character string starting with 'S'"
+                        "STELLAR_SECRET_KEY must be a valid Stellar ed25519 secret key"
                             .to_string(),
                     );
                 }
@@ -139,12 +163,30 @@ impl AppConfig {
             }
         };
 
-        // Parse webhook URLs (comma-separated, ignore empty)
+        match Url::parse(&redis_url) {
+            Ok(url) if matches!(url.scheme(), "redis" | "rediss") => {}
+            Ok(_) | Err(_) => {
+                errors.push(format!(
+                    "REDIS_URL must be a valid redis:// or rediss:// URL, got '{}'",
+                    redis_url
+                ));
+            }
+        }
+
+        if rate_limit_burst == 0 {
+            errors.push("RATE_LIMIT_BURST must be greater than 0".to_string());
+        }
+
         let webhook_urls: Vec<String> = webhook_urls_raw
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(String::from)
+            .map(|url| {
+                if Url::parse(url).is_err() {
+                    errors.push(format!("WEBHOOK_URLS must contain valid URLs, got '{}'", url));
+                }
+                url.to_string()
+            })
             .collect();
 
         if !errors.is_empty() {
@@ -200,7 +242,7 @@ mod tests {
         clear_env();
         env::set_var(
             "STELLAR_SECRET_KEY",
-            "SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "SBU2RRGLXH3E5CQHTD3ODLDF2BWDCYUSSBLLZ5GNW7JXHDIYKXZWHOKR",
         );
         let cfg = AppConfig::from_env().expect("config should load with defaults");
 
@@ -220,14 +262,36 @@ mod tests {
         clear_env();
         env::set_var("PORT", "0");
         env::set_var("STELLAR_HORIZON_URL", "not-a-url");
+        env::set_var("REDIS_URL", "not-a-url");
         env::set_var("RATE_LIMIT_PER_SECOND", "0");
+        env::set_var("RATE_LIMIT_BURST", "0");
+        env::set_var("WEBHOOK_URLS", "https://ok.example.com, not-a-url");
+        env::set_var(
+            "STELLAR_SECRET_KEY",
+            "SBU2RRGLXH3E5CQHTD3ODLDF2BWDCYUSSBLLZ5GNW7JXHDIYKXZWHOKR",
+        );
 
         let err = AppConfig::from_env().expect_err("config should fail");
         let msg = err.to_string();
 
         assert!(msg.contains("PORT must be between 1 and 65535"));
         assert!(msg.contains("STELLAR_HORIZON_URL must be a valid URL"));
+        assert!(msg.contains("REDIS_URL must be a valid redis:// or rediss:// URL"));
         assert!(msg.contains("RATE_LIMIT_PER_SECOND must be greater than 0"));
+        assert!(msg.contains("RATE_LIMIT_BURST must be greater than 0"));
+        assert!(msg.contains("WEBHOOK_URLS must contain valid URLs"));
+    }
+
+    #[test]
+    fn from_env_rejects_invalid_stellar_secret_key() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        env::set_var("STELLAR_SECRET_KEY", "SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+
+        let err = AppConfig::from_env().expect_err("config should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("STELLAR_SECRET_KEY must be a valid Stellar ed25519 secret key"));
     }
 
     #[test]
@@ -238,10 +302,11 @@ mod tests {
         env::set_var("STELLAR_HORIZON_URL", "https://example.com");
         env::set_var("REDIS_URL", "redis://redis:6379");
         env::set_var("RATE_LIMIT_PER_SECOND", "100");
+        env::set_var("RATE_LIMIT_BURST", "100");
         env::set_var("WEBHOOK_URLS", "https://a.com, https://b.com");
         env::set_var(
             "STELLAR_SECRET_KEY",
-            "SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "SBU2RRGLXH3E5CQHTD3ODLDF2BWDCYUSSBLLZ5GNW7JXHDIYKXZWHOKR",
         );
 
         let cfg = AppConfig::from_env().expect("config should load");
@@ -250,6 +315,29 @@ mod tests {
         assert_eq!(cfg.stellar_horizon_url, "https://example.com");
         assert_eq!(cfg.redis_url, "redis://redis:6379");
         assert_eq!(cfg.rate_limit_per_second, 100);
+        assert_eq!(cfg.rate_limit_burst, 100);
         assert_eq!(cfg.webhook_urls.len(), 2);
+    }
+
+    #[test]
+    fn debug_redacts_secret_values() {
+        let config = AppConfig {
+            port: 8080,
+            stellar_horizon_url: "https://example.com".to_string(),
+            stellar_secret_key: Some("secret-value".to_string()),
+            redis_url: "redis://redis:6379".to_string(),
+            rate_limit_per_second: 10,
+            rate_limit_burst: 10,
+            stellar_max_retries: 3,
+            log_level: "info".to_string(),
+            webhook_urls: vec!["https://webhook.example.com".to_string()],
+            webhook_secret: Some("another-secret".to_string()),
+            cache_verification_ttl: 3600,
+        };
+
+        let debug = format!("{:?}", config);
+        assert!(!debug.contains("secret-value"));
+        assert!(!debug.contains("another-secret"));
+        assert!(debug.contains("<redacted>"));
     }
 }

@@ -156,12 +156,21 @@ The `MetricsRegistry` exposes the following cache-related counters:
 | `cache_expired_total` | Entry found but TTL had elapsed (counted as miss) |
 | `cache_serialization_failures_total` | Deserialization error on a cached value |
 
-### Operational Tuning
+### Environment Reference
 
-| Variable | Default | Description |
+| Variable | Default | Validation / Description |
 |---|---|---|
+| `PORT` | `8080` | Must be a valid port from `1` to `65535` |
+| `STELLAR_HORIZON_URL` | `https://horizon-testnet.stellar.org` | Must parse as a valid URL |
+| `STELLAR_SECRET_KEY` | required | Must be a valid Stellar ed25519 secret key |
+| `REDIS_URL` | `redis://127.0.0.1:6379` | Must parse as `redis://` or `rediss://` |
+| `RATE_LIMIT_PER_SECOND` | `10` | Must be greater than `0` |
+| `RATE_LIMIT_BURST` | same as `RATE_LIMIT_PER_SECOND` | Must be greater than `0` |
+| `STELLAR_MAX_RETRIES` | `3` | Must be a valid unsigned integer |
+| `LOG_LEVEL` | `info` | Log verbosity string |
+| `WEBHOOK_URLS` | empty | Comma-separated list of valid URLs |
+| `WEBHOOK_SECRET` | unset | Optional webhook signing secret |
 | `CACHE_VERIFICATION_TTL` | `3600` | Seconds before a cached verification result expires |
-| `REDIS_URL` | `redis://127.0.0.1:6379` | Redis connection string (production) |
 
 Set `REDIS_URL` to a real Redis instance in production. The in-memory backend is suitable for local development and testing only.
 
