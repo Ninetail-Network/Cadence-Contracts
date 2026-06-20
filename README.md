@@ -29,6 +29,33 @@ It stores **cryptographic hashes of documents** and enables:
 
 * Check if a document exists
 * Confirm authenticity
+* Cross-reference with Stellar Horizon for on-chain proof
+
+#### Verification Proof Source
+
+ProofStell uses a **dual-source verification model**:
+
+1. **Stellar Horizon** (primary) — The service queries `GET /transactions?memo={hash}`
+   against the configured Horizon instance. When a matching transaction is found
+   with a confirmed memo match, the transaction ID and ledger timestamp are returned
+   as authoritative proof.
+
+2. **On-chain contract state** (secondary) — The Soroban contract's `verify_document`
+   method confirms whether a document record exists and is `Active` in persistent
+   storage.
+
+Horizon verification distinguishes four result categories:
+
+| Status | Meaning |
+|---|---|
+| `ConfirmedMatch` | A Stellar transaction with matching memo was found — proof is authoritative |
+| `NoMatch` | Horizon was reachable but no transaction matches the hash |
+| `NetworkError` | All retries exhausted due to connection or HTTP errors |
+| `MalformedResponse` | Horizon returned a response that could not be parsed |
+
+Only `ConfirmedMatch` constitutes a positive verification. All other results
+are treated as non-verified (the document may still be valid on-chain, but no
+Horizon proof exists).
 
 ---
 
