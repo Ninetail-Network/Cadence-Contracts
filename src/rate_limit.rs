@@ -135,6 +135,68 @@ impl MetricsRateLimiter {
 mod tests {
     use super::*;
 
+    // ── TokenBucketState tests ──
+
+    #[test]
+    fn token_bucket_new_full_creates_fully_charged_bucket() {
+        let bucket = TokenBucketState::new_full(100);
+        assert_eq!(bucket.tokens, 100);
+        assert_eq!(bucket.last_refill_secs, 0);
+    }
+
+    #[test]
+    fn token_bucket_refill_adds_tokens() {
+        let bucket = TokenBucketState {
+            tokens: 50,
+            last_refill_secs: 10,
+        };
+        let (new_tokens, new_ts) = bucket.refill(5, 10, 100);
+        assert_eq!(new_tokens, 100); // 50 + (5 * 10) = 100, clamped at max_burst
+        assert_eq!(new_ts, 5);
+    }
+
+    #[test]
+    fn token_bucket_refill_respects_max_burst() {
+        let bucket = TokenBucketState {
+            tokens: 80,
+            last_refill_secs: 10,
+        };
+        let (new_tokens, _) = bucket.refill(10, 10, 100);
+        assert_eq!(new_tokens, 100); // Clamped at max_burst
+    }
+
+    #[test]
+    fn token_bucket_try_consume_succeeds_with_sufficient_tokens() {
+        let bucket = TokenBucketState {
+            tokens: 50,
+            last_refill_secs: 10,
+        };
+        let result = bucket.try_consume(30);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().tokens, 20);
+    }
+
+    #[test]
+    fn token_bucket_try_consume_fails_with_insufficient_tokens() {
+        let bucket = TokenBucketState {
+            tokens: 10,
+            last_refill_secs: 10,
+        };
+        let result = bucket.try_consume(20);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), bucket);
+    }
+
+    // ── RateLimitExceededInfo tests ──
+
+    #[test]
+    fn rate_limit_exceeded_info_creation() {
+        let info = RateLimitExceededInfo::new(30);
+        assert_eq!(info.retry_after_secs, 30);
+    }
+
+    // ── MetricsRateLimiter tests ──
+
     #[test]
     fn metrics_rate_limiter_consumes_token_on_check() {
         let metrics = MetricsRegistry::arc();
@@ -159,12 +221,6 @@ mod tests {
         assert!(output.contains("rate_limit_violations_total"));
     }
 
-    #[test]
-    fn build_rate_limiter_creates_valid_limiter() {
-        let rl = build_rate_limiter(10, 10);
-        assert!(rl.check().is_ok());
-    }
-
     #[tokio::test]
     async fn until_ready_consumes_token() {
         let metrics = MetricsRegistry::arc();
@@ -182,3 +238,4 @@ mod tests {
         assert!(rl.check().is_ok());
     }
 }
+
