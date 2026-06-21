@@ -773,6 +773,7 @@ impl ProofStellContract {
                 burst: 100,
             })
     }
+}
 
 #[cfg(test)]
 mod tests {
