@@ -66,6 +66,124 @@ Horizon proof exists).
 
 ---
 
+### 🛡️ Rate Limiting
+
+**Why Rate Limiting?** Without rate limits, attackers can spam the contract with thousands of
+registrations/revocations, polluting state and causing denial-of-service conditions. ProofStell
+enforces **per-issuer** and **per-address** rate limits to prevent abuse while maintaining
+fair access for legitimate high-volume users.
+
+#### Rate Limit Architecture
+
+The contract uses a **token bucket algorithm**:
+
+- Each issuer and address gets a **bucket** of tokens that refills at a fixed rate per second
+- Registrations and revocations **consume 1 token** each
+- When a bucket is empty, operations are rejected with `RateLimitExceeded`
+- Tokens refill over time, allowing burst operations
+
+#### On-Chain Configuration
+
+These constants are compiled into the contract and require redeployment to change:
+
+```rust
+const ISSUER_RATE_LIMIT_PER_SECOND: u64 = 100;     // Per-issuer refill rate
+const ISSUER_RATE_LIMIT_BURST: u64 = 100;          // Per-issuer max tokens
+const ADDRESS_RATE_LIMIT_PER_SECOND: u64 = 50;     // Per-address refill rate
+const ADDRESS_RATE_LIMIT_BURST: u64 = 50;          // Per-address max tokens
+const OPERATION_COST: u64 = 1;                      // Tokens per operation
+```
+
+**Default Behavior:**
+- Each issuer can register/revoke **100 documents instantly** (burst), then at **100/sec** sustained
+- Each address (owner) can have documents registered **50 times instantly**, then at **50/sec** sustained
+- Separate limits are **independent** — one issuer reaching the limit doesn't affect others
+
+#### Service-Side Configuration
+
+For HTTP service deployments, configure rate limits via environment variables:
+
+```bash
+# Global rate limit (service-level, not contract)
+export RATE_LIMIT_PER_SECOND=10
+export RATE_LIMIT_BURST=10
+
+# Per-issuer rate limit
+export RATE_LIMIT_PER_ISSUER_PER_SECOND=100
+export RATE_LIMIT_PER_ISSUER_BURST=100
+
+# Per-address rate limit
+export RATE_LIMIT_PER_ADDRESS_PER_SECOND=50
+export RATE_LIMIT_PER_ADDRESS_BURST=50
+```
+
+#### Tuning for Production
+
+**High-Volume Issuers:**
+
+If your users register >100 documents/sec on average, increase constants before deployment:
+
+```rust
+const ISSUER_RATE_LIMIT_PER_SECOND: u64 = 1000;    // 1000 ops/sec sustained
+const ISSUER_RATE_LIMIT_BURST: u64 = 1000;         // 1000 instant operations
+```
+
+Redeploy the contract:
+```bash
+cargo build --target wasm32-unknown-unknown --release
+soroban contract deploy --wasm target/wasm32-unknown-unknown/release/proofstell_contract.wasm --network testnet
+```
+
+**Conservative (Testing/Small Scale):**
+
+```rust
+const ISSUER_RATE_LIMIT_PER_SECOND: u64 = 10;
+const ISSUER_RATE_LIMIT_BURST: u64 = 10;
+const ADDRESS_RATE_LIMIT_PER_SECOND: u64 = 5;
+const ADDRESS_RATE_LIMIT_BURST: u64 = 5;
+```
+
+#### Error Handling
+
+When rate limits are exceeded, the contract returns:
+
+```
+ContractError::RateLimitExceeded (code: 7)
+```
+
+Clients should:
+
+1. **Retry with exponential backoff** (1s, 2s, 4s, ...)
+2. **Monitor metrics** to detect systematic rate limit issues
+3. **Request quota increase** if sustained demand exceeds configured limits
+
+#### Metrics & Monitoring
+
+Prometheus metrics track rate limit behavior:
+
+- `rate_limit_tokens_consumed_total` — Total tokens consumed across all limits
+- `rate_limit_violations_total` — Total requests rejected (global)
+- `issuer_rate_limit_violations_total` — Per-issuer violations
+- `address_rate_limit_violations_total` — Per-address violations
+- `issuer_rate_limit_resets_total` — Bucket refills after exhaustion
+- `address_rate_limit_resets_total` — Bucket refills after exhaustion
+
+**Example Prometheus Query:**
+```promql
+# Rate of rate limit violations in the last 5 minutes
+rate(rate_limit_violations_total[5m])
+
+# Percentage of requests hitting rate limit
+(rate(rate_limit_violations_total[1m]) / rate(requests_total[1m])) * 100
+```
+
+If violations spike, you may need to:
+- Increase rate limit thresholds (redeploy contract)
+- Identify and block abusive callers
+- Scale infrastructure to handle higher request volume
+
+---
+
 ## 🧠 How It Works
 
 1. Document is hashed (SHA256)
