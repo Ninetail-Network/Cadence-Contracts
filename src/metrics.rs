@@ -373,6 +373,22 @@ impl MetricsRegistry {
         self.rate_limit_violations.inc();
     }
 
+    pub fn increment_issuer_rate_limit_violation(&self) {
+        self.issuer_rate_limit_violations.inc();
+    }
+
+    pub fn increment_address_rate_limit_violation(&self) {
+        self.address_rate_limit_violations.inc();
+    }
+
+    pub fn increment_issuer_rate_limit_reset(&self) {
+        self.issuer_rate_limit_resets.inc();
+    }
+
+    pub fn increment_address_rate_limit_reset(&self) {
+        self.address_rate_limit_resets.inc();
+    }
+
     // ── Event ingestion metrics ──────────────────────────────────────────
 
     pub fn increment_event_duplicate(&self) {
