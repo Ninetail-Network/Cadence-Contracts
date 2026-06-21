@@ -43,6 +43,10 @@ impl fmt::Debug for AppConfig {
             .field("redis_url", &self.redis_url)
             .field("rate_limit_per_second", &self.rate_limit_per_second)
             .field("rate_limit_burst", &self.rate_limit_burst)
+            .field("rate_limit_per_issuer_per_second", &self.rate_limit_per_issuer_per_second)
+            .field("rate_limit_per_issuer_burst", &self.rate_limit_per_issuer_burst)
+            .field("rate_limit_per_address_per_second", &self.rate_limit_per_address_per_second)
+            .field("rate_limit_per_address_burst", &self.rate_limit_per_address_burst)
             .field("stellar_max_retries", &self.stellar_max_retries)
             .field("log_level", &self.log_level)
             .field("webhook_urls", &self.webhook_urls)
@@ -112,6 +116,14 @@ impl AppConfig {
         let rate_limit_per_second_raw = get_env_or_default("RATE_LIMIT_PER_SECOND", "10");
         let rate_limit_burst_raw =
             get_env_or_default("RATE_LIMIT_BURST", &rate_limit_per_second_raw);
+        let rate_limit_per_issuer_per_second_raw =
+            get_env_or_default("RATE_LIMIT_PER_ISSUER_PER_SECOND", "100");
+        let rate_limit_per_issuer_burst_raw =
+            get_env_or_default("RATE_LIMIT_PER_ISSUER_BURST", &rate_limit_per_issuer_per_second_raw);
+        let rate_limit_per_address_per_second_raw =
+            get_env_or_default("RATE_LIMIT_PER_ADDRESS_PER_SECOND", "50");
+        let rate_limit_per_address_burst_raw =
+            get_env_or_default("RATE_LIMIT_PER_ADDRESS_BURST", &rate_limit_per_address_per_second_raw);
         let stellar_max_retries_raw = get_env_or_default("STELLAR_MAX_RETRIES", "3");
         let cache_verification_ttl_raw = get_env_or_default("CACHE_VERIFICATION_TTL", "3600");
 
