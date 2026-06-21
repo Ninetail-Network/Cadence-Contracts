@@ -1,9 +1,28 @@
 #![no_std]
 
+// The service-side modules require std and are only available on non-WASM targets.
+#[cfg(not(target_arch = "wasm32"))]
+extern crate std;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod cache;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod config;
 #[cfg(not(target_arch = "wasm32"))]
 #[macro_use]
 extern crate std;
 
+pub mod error;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod event;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod hash_validator;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod metrics;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod rate_limit;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod stellar;
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
 };

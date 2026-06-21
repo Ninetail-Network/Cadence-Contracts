@@ -4,6 +4,10 @@ use alloc::{
     format,
     string::{String, ToString},
 };
+use std::collections::{HashMap, HashSet};
+use std::prelude::v1::*;
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -50,7 +54,11 @@ impl ContractEventContext {
     pub fn idempotency_key(&self, aggregate_id: &str, event_type: &str) -> String {
         format!(
             "contract:{}:{}:{}:{}:{}",
-            self.transaction_hash, self.ledger_sequence, self.event_index, aggregate_id, event_type
+            self.transaction_hash,
+            self.ledger_sequence,
+            self.event_index,
+            aggregate_id,
+            event_type
         )
     }
 
@@ -180,6 +188,106 @@ impl Event {
     }
 }
 
+/// An event ingestion pipeline that records metrics for duplicates, ordering failures,
+/// and backlog size.
+///
+/// This is a minimal in-memory implementation suitable for testing and local development.
+/// Production deployments should replace this with a persistent event store.
+///
+/// **Note on memory growth:** The `seen_keys` and `last_sequence` collections grow
+/// unboundedly with no eviction strategy. A production implementation should use
+/// an LRU cache or TTL-based eviction to prevent unbounded memory consumption.
+pub struct EventIngestor {
+    /// Set of seen idempotency keys for deduplication.
+    seen_keys: HashSet<String>,
+    /// Last seen sequence number per aggregate for ordering validation.
+    last_sequence: HashMap<String, u64>,
+    /// Metrics registry for instrumentation.
+    metrics: Option<Arc<crate::metrics::MetricsRegistry>>,
+}
+
+impl EventIngestor {
+    pub fn new() -> Self {
+        Self {
+            seen_keys: HashSet::new(),
+            last_sequence: HashMap::new(),
+            metrics: None,
+        }
+    }
+
+    pub fn with_metrics(
+        mut self,
+        metrics: Arc<crate::metrics::MetricsRegistry>,
+    ) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Attempt to ingest an event, recording appropriate metrics.
+    ///
+    /// Returns `Ok(())` if the event was accepted, or an error describing why it was rejected.
+    pub fn ingest(&mut self, event: &Event) -> crate::error::Result<()> {
+        // Check for duplicates via idempotency key
+        if !self.seen_keys.insert(event.idempotency_key.clone()) {
+            if let Some(ref m) = self.metrics {
+                m.increment_event_duplicate();
+            }
+            return Err(crate::error::AuditError::InvalidContractEventContext(
+                format!("duplicate event: idempotency_key={}", event.idempotency_key),
+            ));
+        }
+
+        // Check ordering: sequence must be greater than the last seen for this aggregate
+        let last_seq = self.last_sequence.get(&event.aggregate_id).copied();
+        if let Some(last) = last_seq {
+            if event.sequence <= last {
+                if let Some(ref m) = self.metrics {
+                    m.increment_event_ordering_failure();
+                }
+                return Err(crate::error::AuditError::InvalidContractEventContext(
+                    format!(
+                        "ordering failure: aggregate={} current_seq={} last_seq={}",
+                        event.aggregate_id, event.sequence, last
+                    ),
+                ));
+            }
+        }
+
+        // Accept the event
+        self.last_sequence
+            .insert(event.aggregate_id.clone(), event.sequence);
+
+        // Update backlog gauge (increment on accept)
+        if let Some(ref m) = self.metrics {
+            m.increment_event_backlog();
+        }
+
+        Ok(())
+    }
+
+    /// Mark events as processed, decrementing the backlog gauge.
+    pub fn mark_processed(&self, count: u64) {
+        if let Some(ref m) = self.metrics {
+            for _ in 0..count {
+                m.decrement_event_backlog();
+            }
+        }
+    }
+
+    /// Set the backlog gauge to an explicit size.
+    pub fn set_backlog_size(&self, size: i64) {
+        if let Some(ref m) = self.metrics {
+            m.set_event_backlog(size);
+        }
+    }
+}
+
+impl Default for EventIngestor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,6 +381,86 @@ mod tests {
         )
         .expect_err("context should fail validation");
 
-        assert!(err.to_string().contains("invalid contract event context"));
+        assert!(err
+            .to_string()
+            .contains("invalid contract event context"));
+    }
+
+    #[test]
+    fn event_ingestor_accepts_valid_event() {
+        let metrics = crate::metrics::MetricsRegistry::arc();
+        let mut ingestor = EventIngestor::new().with_metrics(Arc::clone(&metrics));
+
+        let event = Event::new(
+            "doc-1".to_string(),
+            "Created".to_string(),
+            serde_json::json!({"title": "Test"}),
+            "user-1".to_string(),
+        );
+
+        assert!(ingestor.ingest(&event).is_ok());
+        let output = metrics.render();
+        assert!(output.contains("event_backlog_size"));
+    }
+
+    #[test]
+    fn event_ingestor_rejects_duplicate() {
+        let metrics = crate::metrics::MetricsRegistry::arc();
+        let mut ingestor = EventIngestor::new().with_metrics(Arc::clone(&metrics));
+
+        let event = Event::new(
+            "doc-1".to_string(),
+            "Created".to_string(),
+            serde_json::json!({"title": "Test"}),
+            "user-1".to_string(),
+        );
+
+        assert!(ingestor.ingest(&event).is_ok());
+        let result = ingestor.ingest(&event);
+        assert!(result.is_err());
+
+        let output = metrics.render();
+        assert!(output.contains("event_duplicates_total"));
+    }
+
+    #[test]
+    fn event_ingestor_rejects_out_of_order() {
+        let metrics = crate::metrics::MetricsRegistry::arc();
+        let mut ingestor = EventIngestor::new().with_metrics(Arc::clone(&metrics));
+
+        let event1 = Event::new(
+            "doc-1".to_string(),
+            "Updated".to_string(),
+            serde_json::json!({"v": 1}),
+            "user-1".to_string(),
+        )
+        .with_sequence(10);
+
+        let event2 = Event::new(
+            "doc-1".to_string(),
+            "Updated".to_string(),
+            serde_json::json!({"v": 2}),
+            "user-1".to_string(),
+        )
+        .with_sequence(5); // earlier sequence than event1
+
+        assert!(ingestor.ingest(&event1).is_ok());
+        let result = ingestor.ingest(&event2);
+        assert!(result.is_err());
+
+        let output = metrics.render();
+        assert!(output.contains("event_ordering_failures_total"));
+    }
+
+    #[test]
+    fn event_ingestor_mark_processed_decrements_backlog() {
+        let metrics = crate::metrics::MetricsRegistry::arc();
+        let ingestor = EventIngestor::new().with_metrics(Arc::clone(&metrics));
+
+        ingestor.set_backlog_size(5);
+        ingestor.mark_processed(3);
+
+        let output = metrics.render();
+        assert!(output.contains("event_backlog_size"));
     }
 }

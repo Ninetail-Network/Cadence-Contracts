@@ -29,6 +29,33 @@ It stores **cryptographic hashes of documents** and enables:
 
 * Check if a document exists
 * Confirm authenticity
+* Cross-reference with Stellar Horizon for on-chain proof
+
+#### Verification Proof Source
+
+ProofStell uses a **dual-source verification model**:
+
+1. **Stellar Horizon** (primary) — The service queries `GET /transactions?memo={hash}`
+   against the configured Horizon instance. When a matching transaction is found
+   with a confirmed memo match, the transaction ID and ledger timestamp are returned
+   as authoritative proof.
+
+2. **On-chain contract state** (secondary) — The Soroban contract's `verify_document`
+   method confirms whether a document record exists and is `Active` in persistent
+   storage.
+
+Horizon verification distinguishes four result categories:
+
+| Status | Meaning |
+|---|---|
+| `ConfirmedMatch` | A Stellar transaction with matching memo was found — proof is authoritative |
+| `NoMatch` | Horizon was reachable but no transaction matches the hash |
+| `NetworkError` | All retries exhausted due to connection or HTTP errors |
+| `MalformedResponse` | Horizon returned a response that could not be parsed |
+
+Only `ConfirmedMatch` constitutes a positive verification. All other results
+are treated as non-verified (the document may still be valid on-chain, but no
+Horizon proof exists).
 
 ---
 
@@ -149,18 +176,93 @@ Cache keys are typed via the `CacheKey` enum to prevent namespace collisions:
 | `CacheKey::Verification(hash)` | `verification:` | `verification:e3b0c4…` |
 | `CacheKey::Config(key)` | `config:` | `config:rate_limit` |
 
-Callers must use the appropriate variant — raw string keys are no longer accepted.
+Callers must use the appropriate variant — raw string keys are no longer accepted.### Metrics
 
-### Metrics
+The `MetricsRegistry` (defined in `src/metrics.rs`) is the central instrumentation hub for the ProofStell service layer. All service modules emit metrics through this registry, which exposes a Prometheus-compatible text-format endpoint at `/metrics`.
 
-The `MetricsRegistry` exposes the following cache-related counters:
+#### General Request Metrics
 
-| Metric | Description |
-|---|---|
-| `cache_hits_total` | Entry found and returned |
-| `cache_misses_total` | Entry not found |
-| `cache_expired_total` | Entry found but TTL had elapsed (counted as miss) |
-| `cache_serialization_failures_total` | Deserialization error on a cached value |
+| Metric | Type | Description |
+|---|---|---|
+| `requests_total` | Counter | Total number of API requests |
+| `errors_total` | Counter | Total number of errors encountered |
+
+#### Cache Metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `cache_hits_total` | Counter | Entry found and returned |
+| `cache_misses_total` | Counter | Entry not found |
+| `cache_expired_total` | Counter | Entry found but TTL had elapsed (counted as miss) |
+| `cache_serialization_failures_total` | Counter | Deserialization error on a cached value |
+
+#### Document Registration & Revocation Metrics
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `document_registration_total` | CounterVec | `status` (success/error) | Total document registrations by outcome |
+| `document_revocation_total` | CounterVec | `status` (success/error) | Total document revocations by outcome |
+
+#### Verification Metrics
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `verification_total` | CounterVec | `status` (success/failure) | Total verifications by outcome |
+| `verification_latency_seconds` | HistogramVec | `status` | End-to-end verification latency in seconds |
+| `horizon_latency_seconds` | HistogramVec | `status` (success/error) | Stellar Horizon API call latency in seconds |
+| `retry_total` | Counter | — | Total number of retry attempts across all operations |
+
+#### Rate Limiter Metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `rate_limit_tokens_consumed_total` | Counter | Total rate limiter tokens consumed |
+| `rate_limit_violations_total` | Counter | Total rate limit violations (requests rejected) |
+
+#### Event Ingestion Metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `event_duplicates_total` | Counter | Total duplicate events detected and discarded |
+| `event_ordering_failures_total` | Counter | Total events rejected due to ordering/sequence failures |
+| `event_backlog_size` | Gauge | Current number of unprocessed events in the backlog queue |
+
+#### Config Metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `config_validation_failures_total` | Counter | Total configuration validation failures |
+| `config_reload_total` | Counter | Total configuration reloads attempted |
+
+#### Recommended Alerting Thresholds
+
+| Alert | Condition | Severity |
+|---|---|---|
+| High error rate | `rate(errors_total[5m] / requests_total[5m]) > 0.1` | Critical |
+| Low cache hit rate | `rate(cache_hits_total[5m]) / rate(cache_hits_total[5m] + cache_misses_total[5m]) < 0.5` | Warning |
+| High verification failure rate | `rate(verification_total{status="failure"}[5m]) > 0.05` | Warning |
+| Rate limit violations spike | `rate(rate_limit_violations_total[5m]) > 10` | Warning |
+| Event backlog growing | `event_backlog_size > 1000` | Warning |
+| Config validation failures | `increase(config_validation_failures_total[5m]) > 0` | Critical |
+| High Horizon latency | `histogram_quantile(0.95, rate(horizon_latency_seconds_bucket[5m])) > 5` | Warning |
+
+#### Running with Metrics
+
+Build the service binary (non-WASM target):
+
+```bash
+cargo build --release
+```
+
+The `/metrics` endpoint is served by the application HTTP server. To scrape metrics with Prometheus, add a scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: 'proofstell'
+    static_configs:
+      - targets: ['localhost:8080']
+    metrics_path: '/metrics'
+```
 
 ### Environment Reference
 

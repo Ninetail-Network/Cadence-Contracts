@@ -1,3 +1,5 @@
+use std::prelude::v1::*;
+
 #[derive(Debug)]
 pub enum ValidationError {
     WrongLength { expected: usize, actual: usize },
@@ -10,11 +12,6 @@ pub enum HashAlgorithm {
     SHA256,
     SHA512,
 }
-// #[derive(Debug, PartialEq, Eq)]
-// pub enum HashAlgorithm {
-//     SHA256,
-//     SHA512,
-// }
 
 pub struct HashValidator;
 
@@ -72,6 +69,8 @@ impl HashValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Resolve ambiguous panic macro from glob import.
+    use std::panic;
 
     fn sample_sha256() -> &'static str {
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
