@@ -59,6 +59,7 @@ pub enum DataKey {
 /// | `AlreadyRevoked`       | 4    | The document has already been revoked                    |
 /// | `InvalidOwner`         | 5    | The provided owner address is not valid for this op      |
 /// | `InvalidIssuer`        | 6    | The provided issuer address is not valid for this op     |
+/// | `RateLimitExceeded`    | 7    | Operation would exceed rate limit quota                  |
 #[contracterror]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContractError {
@@ -74,6 +75,8 @@ pub enum ContractError {
     InvalidOwner = 5,
     /// The provided issuer address failed validation. Code: 6
     InvalidIssuer = 6,
+    /// Rate limit exceeded; caller should retry after delay. Code: 7
+    RateLimitExceeded = 7,
 }
 
 #[contractevent(topics = ["register"], data_format = "vec")]
