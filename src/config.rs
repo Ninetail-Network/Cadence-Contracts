@@ -296,6 +296,8 @@ mod tests {
             "REDIS_URL",
             "RATE_LIMIT_PER_SECOND",
             "RATE_LIMIT_BURST",
+            "RATE_LIMIT_PER_ISSUER_PER_SECOND",
+            "RATE_LIMIT_PER_ISSUER_BURST",
             "STELLAR_MAX_RETRIES",
             "LOG_LEVEL",
             "WEBHOOK_URLS",
