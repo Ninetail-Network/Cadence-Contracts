@@ -20,6 +20,8 @@ pub mod metrics;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod rate_limit;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod rate_limit_ledger;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod stellar;
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
@@ -48,6 +50,7 @@ pub enum DataKey {
     Admin,
     Version,
     FeatureFlag(Symbol),
+    IssuerRateLimit(Address),
 }
 
 pub const CONTRACT_VERSION: u32 = 1;
