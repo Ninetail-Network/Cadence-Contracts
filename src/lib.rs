@@ -1,9 +1,9 @@
 #![no_std]
 
 #[cfg(not(target_arch = "wasm32"))]
-pub mod error;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod event;
+#[macro_use]
+extern crate std;
+
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
 };

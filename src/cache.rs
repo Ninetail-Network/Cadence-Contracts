@@ -1,9 +1,7 @@
 use anyhow::Result;
 use redis::{aio::ConnectionManager, AsyncCommands};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{collections::HashMap, string::{String, ToString}, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 use tokio::sync::RwLock;
 
 /// Typed cache key variants to prevent key collisions across namespaces.
@@ -101,7 +99,7 @@ impl RedisCache {
     async fn check_connection(&self) -> bool {
         let mut conn = self.connection.clone();
         redis::cmd("PING")
-            .query_async::<_, String>(&mut conn)
+            .query_async::<String>(&mut conn)
             .await
             .is_ok()
     }

@@ -1,8 +1,15 @@
-use std::{env, fmt};
+use std::{env, fmt, string::{String, ToString}, vec::Vec};
 
 use thiserror::Error;
 use stellar_strkey::ed25519::PrivateKey;
 use url::Url;
+
+const DEFAULT_STELLAR_RETRY_BASE_DELAY_MS: u64 = 100;
+const DEFAULT_STELLAR_RETRY_MAX_DELAY_MS: u64 = 10_000;
+const DEFAULT_STELLAR_REQUEST_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_STELLAR_CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 5;
+const DEFAULT_STELLAR_CIRCUIT_BREAKER_OPEN_DURATION_MS: u64 = 30_000;
+const DEFAULT_STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS: u32 = 1;
 
 #[derive(Clone)]
 pub struct AppConfig {
@@ -13,6 +20,13 @@ pub struct AppConfig {
     pub rate_limit_per_second: u32,
     pub rate_limit_burst: u32,
     pub stellar_max_retries: u32,
+    pub stellar_retry_base_delay_ms: u64,
+    pub stellar_retry_max_delay_ms: u64,
+    pub stellar_retry_jitter_enabled: bool,
+    pub stellar_request_timeout_ms: u64,
+    pub stellar_circuit_breaker_failure_threshold: u32,
+    pub stellar_circuit_breaker_open_duration_ms: u64,
+    pub stellar_circuit_breaker_half_open_max_calls: u32,
     pub log_level: String,
     pub webhook_urls: Vec<String>,
     pub webhook_secret: Option<String>,
@@ -32,6 +46,28 @@ impl fmt::Debug for AppConfig {
             .field("rate_limit_per_second", &self.rate_limit_per_second)
             .field("rate_limit_burst", &self.rate_limit_burst)
             .field("stellar_max_retries", &self.stellar_max_retries)
+            .field(
+                "stellar_retry_base_delay_ms",
+                &self.stellar_retry_base_delay_ms,
+            )
+            .field("stellar_retry_max_delay_ms", &self.stellar_retry_max_delay_ms)
+            .field(
+                "stellar_retry_jitter_enabled",
+                &self.stellar_retry_jitter_enabled,
+            )
+            .field("stellar_request_timeout_ms", &self.stellar_request_timeout_ms)
+            .field(
+                "stellar_circuit_breaker_failure_threshold",
+                &self.stellar_circuit_breaker_failure_threshold,
+            )
+            .field(
+                "stellar_circuit_breaker_open_duration_ms",
+                &self.stellar_circuit_breaker_open_duration_ms,
+            )
+            .field(
+                "stellar_circuit_breaker_half_open_max_calls",
+                &self.stellar_circuit_breaker_half_open_max_calls,
+            )
             .field("log_level", &self.log_level)
             .field("webhook_urls", &self.webhook_urls)
             .field(
@@ -53,12 +89,10 @@ impl AppConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         let mut errors = Vec::new();
 
-        // Helper to read env var with default
         fn get_env_or_default(key: &str, default: &str) -> String {
             env::var(key).unwrap_or_else(|_| default.to_string())
         }
 
-        // Basic string values with defaults
         let port_raw = get_env_or_default("PORT", "8080");
         let stellar_horizon_url =
             get_env_or_default("STELLAR_HORIZON_URL", "https://horizon-testnet.stellar.org");
@@ -86,14 +120,37 @@ impl AppConfig {
         };
         let webhook_secret = env::var("WEBHOOK_SECRET").ok();
 
-        // Numeric values with defaults
         let rate_limit_per_second_raw = get_env_or_default("RATE_LIMIT_PER_SECOND", "10");
         let rate_limit_burst_raw =
             get_env_or_default("RATE_LIMIT_BURST", &rate_limit_per_second_raw);
         let stellar_max_retries_raw = get_env_or_default("STELLAR_MAX_RETRIES", "3");
+        let stellar_retry_base_delay_ms_raw = get_env_or_default(
+            "STELLAR_RETRY_BASE_DELAY_MS",
+            &DEFAULT_STELLAR_RETRY_BASE_DELAY_MS.to_string(),
+        );
+        let stellar_retry_max_delay_ms_raw = get_env_or_default(
+            "STELLAR_RETRY_MAX_DELAY_MS",
+            &DEFAULT_STELLAR_RETRY_MAX_DELAY_MS.to_string(),
+        );
+        let stellar_retry_jitter_raw = get_env_or_default("STELLAR_RETRY_JITTER", "true");
+        let stellar_request_timeout_ms_raw = get_env_or_default(
+            "STELLAR_REQUEST_TIMEOUT_MS",
+            &DEFAULT_STELLAR_REQUEST_TIMEOUT_MS.to_string(),
+        );
+        let stellar_circuit_breaker_failure_threshold_raw = get_env_or_default(
+            "STELLAR_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+            &DEFAULT_STELLAR_CIRCUIT_BREAKER_FAILURE_THRESHOLD.to_string(),
+        );
+        let stellar_circuit_breaker_open_duration_ms_raw = get_env_or_default(
+            "STELLAR_CIRCUIT_BREAKER_OPEN_DURATION_MS",
+            &DEFAULT_STELLAR_CIRCUIT_BREAKER_OPEN_DURATION_MS.to_string(),
+        );
+        let stellar_circuit_breaker_half_open_max_calls_raw = get_env_or_default(
+            "STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS",
+            &DEFAULT_STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS.to_string(),
+        );
         let cache_verification_ttl_raw = get_env_or_default("CACHE_VERIFICATION_TTL", "3600");
 
-        // Parse and validate port
         let port: u16 = match port_raw.parse() {
             Ok(p) if p > 0 => p,
             Ok(_) => {
@@ -106,7 +163,6 @@ impl AppConfig {
             }
         };
 
-        // Validate horizon URL
         if Url::parse(&stellar_horizon_url).is_err() {
             errors.push(format!(
                 "STELLAR_HORIZON_URL must be a valid URL, got '{}'",
@@ -114,7 +170,6 @@ impl AppConfig {
             ));
         }
 
-        // Parse numeric values
         let rate_limit_per_second: u32 = match rate_limit_per_second_raw.parse() {
             Ok(v) if v > 0 => v,
             Ok(_) => {
@@ -152,6 +207,120 @@ impl AppConfig {
             }
         };
 
+        let stellar_retry_base_delay_ms: u64 = match stellar_retry_base_delay_ms_raw.parse() {
+            Ok(v) if v > 0 => v,
+            Ok(_) => {
+                errors.push("STELLAR_RETRY_BASE_DELAY_MS must be greater than 0".to_string());
+                DEFAULT_STELLAR_RETRY_BASE_DELAY_MS
+            }
+            Err(_) => {
+                errors.push(format!(
+                    "STELLAR_RETRY_BASE_DELAY_MS must be a valid u64, got '{}'",
+                    stellar_retry_base_delay_ms_raw
+                ));
+                DEFAULT_STELLAR_RETRY_BASE_DELAY_MS
+            }
+        };
+
+        let stellar_retry_max_delay_ms: u64 = match stellar_retry_max_delay_ms_raw.parse() {
+            Ok(v) if v > 0 => v,
+            Ok(_) => {
+                errors.push("STELLAR_RETRY_MAX_DELAY_MS must be greater than 0".to_string());
+                DEFAULT_STELLAR_RETRY_MAX_DELAY_MS
+            }
+            Err(_) => {
+                errors.push(format!(
+                    "STELLAR_RETRY_MAX_DELAY_MS must be a valid u64, got '{}'",
+                    stellar_retry_max_delay_ms_raw
+                ));
+                DEFAULT_STELLAR_RETRY_MAX_DELAY_MS
+            }
+        };
+
+        let stellar_retry_jitter_enabled = match stellar_retry_jitter_raw.to_lowercase().as_str() {
+            "1" | "true" | "yes" | "y" => true,
+            "0" | "false" | "no" | "n" => false,
+            other => {
+                errors.push(format!(
+                    "STELLAR_RETRY_JITTER must be a boolean, got '{}'",
+                    other
+                ));
+                true
+            }
+        };
+
+        let stellar_request_timeout_ms: u64 = match stellar_request_timeout_ms_raw.parse() {
+            Ok(v) if v > 0 => v,
+            Ok(_) => {
+                errors.push("STELLAR_REQUEST_TIMEOUT_MS must be greater than 0".to_string());
+                DEFAULT_STELLAR_REQUEST_TIMEOUT_MS
+            }
+            Err(_) => {
+                errors.push(format!(
+                    "STELLAR_REQUEST_TIMEOUT_MS must be a valid u64, got '{}'",
+                    stellar_request_timeout_ms_raw
+                ));
+                DEFAULT_STELLAR_REQUEST_TIMEOUT_MS
+            }
+        };
+
+        let stellar_circuit_breaker_failure_threshold: u32 =
+            match stellar_circuit_breaker_failure_threshold_raw.parse() {
+                Ok(v) if v > 0 => v,
+                Ok(_) => {
+                    errors.push(
+                        "STELLAR_CIRCUIT_BREAKER_FAILURE_THRESHOLD must be greater than 0"
+                            .to_string(),
+                    );
+                    DEFAULT_STELLAR_CIRCUIT_BREAKER_FAILURE_THRESHOLD
+                }
+                Err(_) => {
+                    errors.push(format!(
+                        "STELLAR_CIRCUIT_BREAKER_FAILURE_THRESHOLD must be a valid u32, got '{}'",
+                        stellar_circuit_breaker_failure_threshold_raw
+                    ));
+                    DEFAULT_STELLAR_CIRCUIT_BREAKER_FAILURE_THRESHOLD
+                }
+            };
+
+        let stellar_circuit_breaker_open_duration_ms: u64 =
+            match stellar_circuit_breaker_open_duration_ms_raw.parse() {
+                Ok(v) if v > 0 => v,
+                Ok(_) => {
+                    errors.push(
+                        "STELLAR_CIRCUIT_BREAKER_OPEN_DURATION_MS must be greater than 0"
+                            .to_string(),
+                    );
+                    DEFAULT_STELLAR_CIRCUIT_BREAKER_OPEN_DURATION_MS
+                }
+                Err(_) => {
+                    errors.push(format!(
+                        "STELLAR_CIRCUIT_BREAKER_OPEN_DURATION_MS must be a valid u64, got '{}'",
+                        stellar_circuit_breaker_open_duration_ms_raw
+                    ));
+                    DEFAULT_STELLAR_CIRCUIT_BREAKER_OPEN_DURATION_MS
+                }
+            };
+
+        let stellar_circuit_breaker_half_open_max_calls: u32 =
+            match stellar_circuit_breaker_half_open_max_calls_raw.parse() {
+                Ok(v) if v > 0 => v,
+                Ok(_) => {
+                    errors.push(
+                        "STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS must be greater than 0"
+                            .to_string(),
+                    );
+                    DEFAULT_STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS
+                }
+                Err(_) => {
+                    errors.push(format!(
+                        "STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS must be a valid u32, got '{}'",
+                        stellar_circuit_breaker_half_open_max_calls_raw
+                    ));
+                    DEFAULT_STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS
+                }
+            };
+
         let cache_verification_ttl: u64 = match cache_verification_ttl_raw.parse() {
             Ok(v) => v,
             Err(_) => {
@@ -175,6 +344,13 @@ impl AppConfig {
 
         if rate_limit_burst == 0 {
             errors.push("RATE_LIMIT_BURST must be greater than 0".to_string());
+        }
+
+        if stellar_retry_max_delay_ms < stellar_retry_base_delay_ms {
+            errors.push(
+                "STELLAR_RETRY_MAX_DELAY_MS must be greater than or equal to STELLAR_RETRY_BASE_DELAY_MS"
+                    .to_string(),
+            );
         }
 
         let webhook_urls: Vec<String> = webhook_urls_raw
@@ -202,6 +378,13 @@ impl AppConfig {
             rate_limit_per_second,
             rate_limit_burst,
             stellar_max_retries,
+            stellar_retry_base_delay_ms,
+            stellar_retry_max_delay_ms,
+            stellar_retry_jitter_enabled,
+            stellar_request_timeout_ms,
+            stellar_circuit_breaker_failure_threshold,
+            stellar_circuit_breaker_open_duration_ms,
+            stellar_circuit_breaker_half_open_max_calls,
             log_level,
             webhook_urls,
             webhook_secret,
@@ -226,6 +409,13 @@ mod tests {
             "RATE_LIMIT_PER_SECOND",
             "RATE_LIMIT_BURST",
             "STELLAR_MAX_RETRIES",
+            "STELLAR_RETRY_BASE_DELAY_MS",
+            "STELLAR_RETRY_MAX_DELAY_MS",
+            "STELLAR_RETRY_JITTER",
+            "STELLAR_REQUEST_TIMEOUT_MS",
+            "STELLAR_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+            "STELLAR_CIRCUIT_BREAKER_OPEN_DURATION_MS",
+            "STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS",
             "LOG_LEVEL",
             "WEBHOOK_URLS",
             "WEBHOOK_SECRET",
@@ -254,6 +444,14 @@ mod tests {
         assert_eq!(cfg.redis_url, "redis://127.0.0.1:6379");
         assert_eq!(cfg.rate_limit_per_second, 10);
         assert_eq!(cfg.cache_verification_ttl, 3600);
+        assert_eq!(cfg.stellar_max_retries, 3);
+        assert_eq!(cfg.stellar_retry_base_delay_ms, 100);
+        assert_eq!(cfg.stellar_retry_max_delay_ms, 10_000);
+        assert!(cfg.stellar_retry_jitter_enabled);
+        assert_eq!(cfg.stellar_request_timeout_ms, 10_000);
+        assert_eq!(cfg.stellar_circuit_breaker_failure_threshold, 5);
+        assert_eq!(cfg.stellar_circuit_breaker_open_duration_ms, 30_000);
+        assert_eq!(cfg.stellar_circuit_breaker_half_open_max_calls, 1);
     }
 
     #[test]
@@ -265,6 +463,13 @@ mod tests {
         env::set_var("REDIS_URL", "not-a-url");
         env::set_var("RATE_LIMIT_PER_SECOND", "0");
         env::set_var("RATE_LIMIT_BURST", "0");
+        env::set_var("STELLAR_RETRY_BASE_DELAY_MS", "0");
+        env::set_var("STELLAR_RETRY_MAX_DELAY_MS", "50");
+        env::set_var("STELLAR_RETRY_JITTER", "sometimes");
+        env::set_var("STELLAR_REQUEST_TIMEOUT_MS", "0");
+        env::set_var("STELLAR_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "0");
+        env::set_var("STELLAR_CIRCUIT_BREAKER_OPEN_DURATION_MS", "0");
+        env::set_var("STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS", "0");
         env::set_var("WEBHOOK_URLS", "https://ok.example.com, not-a-url");
         env::set_var(
             "STELLAR_SECRET_KEY",
@@ -279,6 +484,15 @@ mod tests {
         assert!(msg.contains("REDIS_URL must be a valid redis:// or rediss:// URL"));
         assert!(msg.contains("RATE_LIMIT_PER_SECOND must be greater than 0"));
         assert!(msg.contains("RATE_LIMIT_BURST must be greater than 0"));
+        assert!(msg.contains("STELLAR_RETRY_BASE_DELAY_MS must be greater than 0"));
+        assert!(msg.contains(
+            "STELLAR_RETRY_MAX_DELAY_MS must be greater than or equal to STELLAR_RETRY_BASE_DELAY_MS"
+        ));
+        assert!(msg.contains("STELLAR_RETRY_JITTER must be a boolean"));
+        assert!(msg.contains("STELLAR_REQUEST_TIMEOUT_MS must be greater than 0"));
+        assert!(msg.contains("STELLAR_CIRCUIT_BREAKER_FAILURE_THRESHOLD must be greater than 0"));
+        assert!(msg.contains("STELLAR_CIRCUIT_BREAKER_OPEN_DURATION_MS must be greater than 0"));
+        assert!(msg.contains("STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS must be greater than 0"));
         assert!(msg.contains("WEBHOOK_URLS must contain valid URLs"));
     }
 
@@ -303,6 +517,14 @@ mod tests {
         env::set_var("REDIS_URL", "redis://redis:6379");
         env::set_var("RATE_LIMIT_PER_SECOND", "100");
         env::set_var("RATE_LIMIT_BURST", "100");
+        env::set_var("STELLAR_MAX_RETRIES", "5");
+        env::set_var("STELLAR_RETRY_BASE_DELAY_MS", "250");
+        env::set_var("STELLAR_RETRY_MAX_DELAY_MS", "15000");
+        env::set_var("STELLAR_RETRY_JITTER", "false");
+        env::set_var("STELLAR_REQUEST_TIMEOUT_MS", "7500");
+        env::set_var("STELLAR_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "3");
+        env::set_var("STELLAR_CIRCUIT_BREAKER_OPEN_DURATION_MS", "45000");
+        env::set_var("STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS", "2");
         env::set_var("WEBHOOK_URLS", "https://a.com, https://b.com");
         env::set_var(
             "STELLAR_SECRET_KEY",
@@ -316,6 +538,14 @@ mod tests {
         assert_eq!(cfg.redis_url, "redis://redis:6379");
         assert_eq!(cfg.rate_limit_per_second, 100);
         assert_eq!(cfg.rate_limit_burst, 100);
+        assert_eq!(cfg.stellar_max_retries, 5);
+        assert_eq!(cfg.stellar_retry_base_delay_ms, 250);
+        assert_eq!(cfg.stellar_retry_max_delay_ms, 15_000);
+        assert!(!cfg.stellar_retry_jitter_enabled);
+        assert_eq!(cfg.stellar_request_timeout_ms, 7500);
+        assert_eq!(cfg.stellar_circuit_breaker_failure_threshold, 3);
+        assert_eq!(cfg.stellar_circuit_breaker_open_duration_ms, 45_000);
+        assert_eq!(cfg.stellar_circuit_breaker_half_open_max_calls, 2);
         assert_eq!(cfg.webhook_urls.len(), 2);
     }
 
@@ -329,6 +559,13 @@ mod tests {
             rate_limit_per_second: 10,
             rate_limit_burst: 10,
             stellar_max_retries: 3,
+            stellar_retry_base_delay_ms: 100,
+            stellar_retry_max_delay_ms: 10_000,
+            stellar_retry_jitter_enabled: true,
+            stellar_request_timeout_ms: 10_000,
+            stellar_circuit_breaker_failure_threshold: 5,
+            stellar_circuit_breaker_open_duration_ms: 30_000,
+            stellar_circuit_breaker_half_open_max_calls: 1,
             log_level: "info".to_string(),
             webhook_urls: vec!["https://webhook.example.com".to_string()],
             webhook_secret: Some("another-secret".to_string()),
