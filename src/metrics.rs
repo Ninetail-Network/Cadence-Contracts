@@ -36,6 +36,8 @@ pub struct MetricsRegistry {
     // ── Rate limiter metrics ──
     rate_limit_tokens_consumed: IntCounter,
     rate_limit_violations: IntCounter,
+    rate_limit_per_issuer_hits: IntCounterVec,
+    rate_limit_per_issuer_resets: IntCounterVec,
 
     // ── Event ingestion metrics ──
     event_duplicates: IntCounter,
@@ -138,6 +140,24 @@ impl MetricsRegistry {
         )
         .unwrap();
 
+        let rate_limit_per_issuer_hits = IntCounterVec::new(
+            Opts::new(
+                "rate_limit_per_issuer_hits_total",
+                "Total rate limit hits per issuer (operations exceeding limit)",
+            ),
+            &["issuer"],
+        )
+        .unwrap();
+
+        let rate_limit_per_issuer_resets = IntCounterVec::new(
+            Opts::new(
+                "rate_limit_per_issuer_resets_total",
+                "Total rate limit token resets per issuer (refill events)",
+            ),
+            &["issuer"],
+        )
+        .unwrap();
+
         // ── Event ingestion metrics ──
         let event_duplicates = IntCounter::new(
             "event_duplicates_total",
@@ -214,6 +234,12 @@ impl MetricsRegistry {
             .register(Box::new(rate_limit_violations.clone()))
             .unwrap();
         registry
+            .register(Box::new(rate_limit_per_issuer_hits.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(rate_limit_per_issuer_resets.clone()))
+            .unwrap();
+        registry
             .register(Box::new(event_duplicates.clone()))
             .unwrap();
         registry
@@ -245,6 +271,8 @@ impl MetricsRegistry {
             retry_total,
             rate_limit_tokens_consumed,
             rate_limit_violations,
+            rate_limit_per_issuer_hits,
+            rate_limit_per_issuer_resets,
             event_duplicates,
             event_ordering_failures,
             event_backlog_size,
@@ -327,6 +355,18 @@ impl MetricsRegistry {
 
     pub fn increment_rate_limit_violation(&self) {
         self.rate_limit_violations.inc();
+    }
+
+    pub fn record_rate_limit_hit(&self, issuer: &str) {
+        self.rate_limit_per_issuer_hits
+            .with_label_values(&[issuer])
+            .inc();
+    }
+
+    pub fn record_rate_limit_reset(&self, issuer: &str) {
+        self.rate_limit_per_issuer_resets
+            .with_label_values(&[issuer])
+            .inc();
     }
 
     // ── Event ingestion metrics ──────────────────────────────────────────
@@ -415,6 +455,8 @@ mod tests {
         metrics.increment_retry();
         metrics.record_token_consumed();
         metrics.increment_rate_limit_violation();
+        metrics.record_rate_limit_hit("issuer_123");
+        metrics.record_rate_limit_reset("issuer_123");
         metrics.increment_event_duplicate();
         metrics.increment_event_ordering_failure();
         metrics.set_event_backlog(5);
@@ -430,6 +472,8 @@ mod tests {
         assert!(output.contains("verification_total"));
         assert!(output.contains("horizon_latency_seconds"));
         assert!(output.contains("rate_limit_violations_total"));
+        assert!(output.contains("rate_limit_per_issuer_hits_total"));
+        assert!(output.contains("rate_limit_per_issuer_resets_total"));
         assert!(output.contains("event_backlog_size"));
         assert!(output.contains("config_validation_failures_total"));
     }
