@@ -16,6 +16,14 @@ pub struct AppConfig {
     pub redis_url: String,
     pub rate_limit_per_second: u32,
     pub rate_limit_burst: u32,
+    /// Per-issuer rate limit: operations per second
+    pub rate_limit_per_issuer_per_second: u32,
+    /// Per-issuer rate limit: burst allowance
+    pub rate_limit_per_issuer_burst: u32,
+    /// Per-address rate limit: operations per second
+    pub rate_limit_per_address_per_second: u32,
+    /// Per-address rate limit: burst allowance
+    pub rate_limit_per_address_burst: u32,
     pub stellar_max_retries: u32,
     pub log_level: String,
     pub webhook_urls: Vec<String>,
