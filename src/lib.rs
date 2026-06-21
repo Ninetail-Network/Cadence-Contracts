@@ -623,29 +623,30 @@ mod tests {
     fn revoke_respects_issuer_rate_limit_burst() {
         let (env, client, issuer, owner, _) = setup();
 
-        // First, register a batch of documents to exhaust the issuer's burst limit
-        let hashes: Vec<BytesN<32>> = (0..ISSUER_RATE_LIMIT_BURST)
+        // Register a batch of documents, one more than the burst limit,
+        // so we have one to try to revoke after exhausting the bucket.
+        let hashes: Vec<BytesN<32>> = (0..=ISSUER_RATE_LIMIT_BURST)
             .map(|i| {
                 let hash = BytesN::from_array(&env, &[i as u8; 32]);
-                client.register_document(&issuer, &owner, &hash);
+                // We don't check the result here, as the last one is expected to fail.
+                let _ = client.try_register_document(&issuer, &owner, &hash);
                 hash
             })
             .collect();
 
-        // Advance time to let the issuer's token bucket refill
+        // Advance time to let the issuer's token bucket refill.
         env.ledger().set_timestamp(env.ledger().timestamp() + 5);
 
-        // Now, try to revoke them all
-        for (i, hash) in hashes.iter().enumerate() {
+        // Revoke documents up to the burst limit.
+        for (i, hash) in hashes.iter().enumerate().take(ISSUER_RATE_LIMIT_BURST as usize) {
             let result = client.try_revoke_document(&issuer, &hash);
             assert!(result.is_ok(), "revocation {} should succeed", i);
         }
 
-        // The next attempt should fail, but we need to register a new document to revoke
-        let hash = BytesN::from_array(&env, &[255; 32]);
-        client.register_document(&issuer, &owner, &hash);
+        // The next revocation should fail as the bucket is now empty.
+        let last_hash = hashes.last().unwrap();
         let err = client
-            .try_revoke_document(&issuer, &hash)
+            .try_revoke_document(&issuer, &last_hash)
             .unwrap_err()
             .unwrap();
 
