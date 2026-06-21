@@ -40,9 +40,24 @@ pub struct DocumentRecord {
     pub status: DocumentStatus,
 }
 
+/// Rate limit state for token bucket algorithm.
+/// Tracks available tokens and last refill time for quota enforcement.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitState {
+    /// Current tokens available (0 to max_burst)
+    pub tokens: u64,
+    /// Last refill timestamp (Unix seconds)
+    pub last_refill_secs: u64,
+}
+
 #[contracttype]
 pub enum DataKey {
     Document(BytesN<32>),
+    /// Per-issuer rate limit state
+    IssuerRateLimit(Address),
+    /// Per-address (owner) rate limit state
+    AddressRateLimit(Address),
 }
 
 /// Enumeration of all error conditions that can occur within the ProofStell contract.
