@@ -175,6 +175,58 @@ impl AppConfig {
             }
         };
 
+        let rate_limit_per_issuer_per_second: u32 = match rate_limit_per_issuer_per_second_raw.parse() {
+            Ok(v) if v > 0 => v,
+            Ok(_) => {
+                errors.push("RATE_LIMIT_PER_ISSUER_PER_SECOND must be greater than 0".to_string());
+                100
+            }
+            Err(_) => {
+                errors.push(format!(
+                    "RATE_LIMIT_PER_ISSUER_PER_SECOND must be a valid u32, got '{}'",
+                    rate_limit_per_issuer_per_second_raw
+                ));
+                100
+            }
+        };
+
+        let rate_limit_per_issuer_burst: u32 = match rate_limit_per_issuer_burst_raw.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                errors.push(format!(
+                    "RATE_LIMIT_PER_ISSUER_BURST must be a valid u32, got '{}'",
+                    rate_limit_per_issuer_burst_raw
+                ));
+                rate_limit_per_issuer_per_second
+            }
+        };
+
+        let rate_limit_per_address_per_second: u32 = match rate_limit_per_address_per_second_raw.parse() {
+            Ok(v) if v > 0 => v,
+            Ok(_) => {
+                errors.push("RATE_LIMIT_PER_ADDRESS_PER_SECOND must be greater than 0".to_string());
+                50
+            }
+            Err(_) => {
+                errors.push(format!(
+                    "RATE_LIMIT_PER_ADDRESS_PER_SECOND must be a valid u32, got '{}'",
+                    rate_limit_per_address_per_second_raw
+                ));
+                50
+            }
+        };
+
+        let rate_limit_per_address_burst: u32 = match rate_limit_per_address_burst_raw.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                errors.push(format!(
+                    "RATE_LIMIT_PER_ADDRESS_BURST must be a valid u32, got '{}'",
+                    rate_limit_per_address_burst_raw
+                ));
+                rate_limit_per_address_per_second
+            }
+        };
+
         let stellar_max_retries: u32 = match stellar_max_retries_raw.parse() {
             Ok(v) => v,
             Err(_) => {
