@@ -66,6 +66,28 @@ Horizon proof exists).
 
 ---
 
+### 🔄 Upgrades & Governance
+
+* Single-admin governance — one address (set at `initialize`) controls upgrades, migrations, and feature flags
+* Contract version stored in persistent ledger — survives ledger entry expiry
+* Feature flags allow toggling behaviours without a full WASM upgrade
+* `ContractInitialized` and `ContractUpgraded` events let indexers detect which contract version produced any given document event
+
+---
+
+### 📦 Batch Operations
+
+* `batch_register_documents` — register up to 20 documents in one transaction
+* `batch_revoke_documents` — revoke up to 20 documents in one transaction
+
+**Atomicity:** All documents succeed or none are written. If any item in the batch fails (e.g. duplicate hash, wrong issuer, already revoked), the entire call returns an error and no state is changed.
+
+**Batch size limit:** Maximum 20 documents per call. Exceeding this returns `BatchTooLarge` (error code 7). Empty batches return `BatchEmpty` (error code 8).
+
+**Fee implications:** A single transaction covers the entire batch regardless of size, making bulk operations significantly cheaper than individual calls. For best results, pre-validate document uniqueness and existence client-side before submitting to avoid wasted transaction fees on partial failures.
+
+---
+
 ## 🧠 How It Works
 
 1. Document is hashed (SHA256)
@@ -139,6 +161,68 @@ soroban contract deploy \
 --wasm target/wasm32-unknown-unknown/release/proofstell_contract.wasm \
 --network testnet
 ```
+
+---
+
+### Initialize After Deployment
+
+After deploying, call `initialize` to set the admin address and record version 1 on-chain:
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <ADMIN_SECRET_KEY> \
+  --network testnet \
+  -- initialize \
+  --admin <ADMIN_ADDRESS>
+```
+
+---
+
+### Upgrade Procedure
+
+1. **Build the new WASM** and upload it to the ledger:
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+soroban contract install \
+  --wasm target/wasm32-unknown-unknown/release/proofstell_contract.wasm \
+  --network testnet
+# Note the returned WASM hash
+```
+
+2. **Call `upgrade`** with the new WASM hash:
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <ADMIN_SECRET_KEY> \
+  --network testnet \
+  -- upgrade \
+  --admin <ADMIN_ADDRESS> \
+  --new_wasm_hash <WASM_HASH>
+```
+
+3. **Call `migrate`** to apply any data transformations and bump the version:
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <ADMIN_SECRET_KEY> \
+  --network testnet \
+  -- migrate \
+  --admin <ADMIN_ADDRESS>
+```
+
+### Rollback Plan
+
+Soroban contract upgrades are irreversible on-chain — there is no undo. To roll back:
+
+1. Keep the previous WASM hash recorded before upgrading.
+2. If the new version is broken, call `upgrade` again with the old WASM hash.
+3. If the migration mutated storage in an incompatible way, a compensating migration must be written into the rolled-back WASM.
+
+**Recommendation:** always test upgrades on testnet before applying to mainnet. See [docs/UPGRADE_GOVERNANCE.md](docs/UPGRADE_GOVERNANCE.md) for the full decision process.
 
 ---
 
