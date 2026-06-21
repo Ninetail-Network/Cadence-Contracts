@@ -51,9 +51,31 @@ pub enum DataKey {
     Version,
     FeatureFlag(Symbol),
     IssuerRateLimit(Address),
+    RateLimitConfig,
 }
 
 pub const CONTRACT_VERSION: u32 = 1;
+
+/// Per-issuer rate limit state stored on-chain in the ledger.
+///
+/// Tracks token availability and last refill time for each issuer,
+/// enabling token-bucket rate limiting across ledger instances.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct IssuerRateLimitData {
+    pub available_tokens: u32,
+    pub last_refill_timestamp: u64,
+}
+
+/// Global rate limit configuration for the contract.
+///
+/// Controls per-issuer rate limits for document operations.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RateLimitConfig {
+    pub per_second: u32,
+    pub burst: u32,
+}
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -616,6 +638,63 @@ impl ProofStellContract {
             .persistent()
             .get::<DataKey, bool>(&DataKey::FeatureFlag(flag))
             .unwrap_or(false)
+    }
+
+    /// Check if an issuer can perform a rate-limited operation.
+    ///
+    /// Validates that the issuer has sufficient tokens available based on their rate limit.
+    /// If tokens are available, they are consumed and the function returns Ok(()).
+    /// If the limit is exceeded, returns RateLimitExceeded.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `issuer` - The issuer address to rate limit
+    /// * `tokens_needed` - Number of tokens to consume (usually 1 per operation, or batch size)
+    /// * `per_second` - Rate limit: tokens per second for this issuer
+    /// * `burst` - Maximum burst allowance (initial and refilled cap)
+    fn check_and_update_rate_limit(
+        env: Env,
+        issuer: Address,
+        tokens_needed: u32,
+        per_second: u32,
+        burst: u32,
+    ) -> Result<(), ContractError> {
+        let current_timestamp = env.ledger().timestamp();
+        let rate_limit_key = DataKey::IssuerRateLimit(issuer.clone());
+
+        // Retrieve or initialize rate limit state
+        let mut rate_limit_data: IssuerRateLimitData = env
+            .storage()
+            .persistent()
+            .get(&rate_limit_key)
+            .unwrap_or_else(|| IssuerRateLimitData {
+                available_tokens: burst,
+                last_refill_timestamp: current_timestamp,
+            });
+
+        // Calculate refilled tokens based on elapsed time
+        if current_timestamp > rate_limit_data.last_refill_timestamp {
+            let elapsed_seconds = (current_timestamp - rate_limit_data.last_refill_timestamp) as u32;
+            let tokens_to_add = elapsed_seconds.saturating_mul(per_second);
+            rate_limit_data.available_tokens = rate_limit_data
+                .available_tokens
+                .saturating_add(tokens_to_add)
+                .min(burst);
+            rate_limit_data.last_refill_timestamp = current_timestamp;
+        }
+
+        // Check if enough tokens are available
+        if rate_limit_data.available_tokens < tokens_needed {
+            return Err(ContractError::RateLimitExceeded);
+        }
+
+        // Consume tokens and update storage
+        rate_limit_data.available_tokens -= tokens_needed;
+        env.storage()
+            .persistent()
+            .set(&rate_limit_key, &rate_limit_data);
+
+        Ok(())
     }
 }
 
