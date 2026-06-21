@@ -303,12 +303,16 @@ impl ProofStellContract {
     /// * [`ContractError::DocumentNotFound`]    — if no record exists for this hash
     /// * [`ContractError::OnlyIssuerCanRevoke`] — if the caller is not the original issuer
     /// * [`ContractError::AlreadyRevoked`]      — if the document is already revoked
+    /// * [`ContractError::RateLimitExceeded`]   — if the issuer has exceeded their rate limit
     pub fn revoke_document(
         env: Env,
         issuer: Address,
         document_hash: BytesN<32>,
     ) -> Result<DocumentRecord, ContractError> {
         issuer.require_auth();
+
+        // Check rate limit before processing
+        Self::check_and_update_rate_limit(&env, issuer.clone(), 1)?;
 
         let key = DataKey::Document(document_hash.clone());
 
@@ -355,6 +359,7 @@ impl ProofStellContract {
     /// * [`ContractError::BatchEmpty`]       — if the vector is empty
     /// * [`ContractError::BatchTooLarge`]    — if the vector exceeds 20 items
     /// * [`ContractError::AlreadyRegistered`] — if any document hash is already registered
+    /// * [`ContractError::RateLimitExceeded`] — if the issuer would exceed their rate limit
     pub fn batch_register_documents(
         env: Env,
         issuer: Address,
@@ -368,6 +373,9 @@ impl ProofStellContract {
         if documents.len() > MAX_BATCH_SIZE {
             return Err(ContractError::BatchTooLarge);
         }
+
+        // Check rate limit with cost equal to batch size
+        Self::check_and_update_rate_limit(&env, issuer.clone(), documents.len() as u32)?;
 
         let mut records = Vec::new(&env);
 
@@ -418,6 +426,7 @@ impl ProofStellContract {
     /// * [`ContractError::DocumentNotFound`]    — if any hash has no record
     /// * [`ContractError::OnlyIssuerCanRevoke`] — if the caller is not the original issuer of any document
     /// * [`ContractError::AlreadyRevoked`]      — if any document is already revoked
+    /// * [`ContractError::RateLimitExceeded`]   — if the issuer would exceed their rate limit
     pub fn batch_revoke_documents(
         env: Env,
         issuer: Address,
@@ -431,6 +440,9 @@ impl ProofStellContract {
         if document_hashes.len() > MAX_BATCH_SIZE {
             return Err(ContractError::BatchTooLarge);
         }
+
+        // Check rate limit with cost equal to batch size
+        Self::check_and_update_rate_limit(&env, issuer.clone(), document_hashes.len() as u32)?;
 
         let mut records = Vec::new(&env);
 
