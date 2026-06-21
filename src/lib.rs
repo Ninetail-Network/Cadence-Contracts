@@ -239,6 +239,7 @@ impl ProofStellContract {
     /// Registers a new document on-chain, associating it with an issuer and owner.
     ///
     /// The issuer must authorize this call. Each document hash can only be registered once.
+    /// Rate limits are enforced per issuer and per owner address to prevent abuse.
     ///
     /// # Arguments
     /// * `env`           - The Soroban environment
@@ -251,6 +252,7 @@ impl ProofStellContract {
     ///
     /// # Errors
     /// * [`ContractError::AlreadyRegistered`] — if a record already exists for this hash
+    /// * [`ContractError::RateLimitExceeded`] — if issuer or owner has exceeded rate limits
     pub fn register_document(
         env: Env,
         issuer: Address,
@@ -259,6 +261,26 @@ impl ProofStellContract {
     ) -> Result<DocumentRecord, ContractError> {
         issuer.require_auth();
 
+        // ── Rate limit checks ──
+        // Check issuer rate limit
+        Self::check_issuer_rate_limit(
+            &env,
+            &issuer,
+            OPERATION_COST,
+            ISSUER_RATE_LIMIT_PER_SECOND,
+            ISSUER_RATE_LIMIT_BURST,
+        )?;
+
+        // Check owner (address) rate limit
+        Self::check_address_rate_limit(
+            &env,
+            &owner,
+            OPERATION_COST,
+            ADDRESS_RATE_LIMIT_PER_SECOND,
+            ADDRESS_RATE_LIMIT_BURST,
+        )?;
+
+        // ── Document registration ──
         let key = DataKey::Document(document_hash.clone());
 
         if env.storage().persistent().has(&key) {
