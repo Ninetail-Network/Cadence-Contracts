@@ -114,6 +114,111 @@ pub struct ProofStellContract;
 
 #[contractimpl]
 impl ProofStellContract {
+    /// Check and consume tokens from the issuer's rate limit bucket.
+    ///
+    /// Uses a token bucket algorithm: refills at `refill_rate` tokens per second
+    /// (up to `max_burst`), and consumes `cost` tokens per operation.
+    ///
+    /// # Arguments
+    /// * `env`        - The Soroban environment
+    /// * `issuer`     - Address of the issuer to rate-limit
+    /// * `cost`       - Tokens to consume for this operation
+    /// * `refill_rate` - Tokens added per second
+    /// * `max_burst`  - Maximum bucket capacity
+    ///
+    /// # Errors
+    /// * [`ContractError::RateLimitExceeded`] — if insufficient tokens are available
+    fn check_issuer_rate_limit(
+        env: &Env,
+        issuer: &Address,
+        cost: u64,
+        refill_rate: u64,
+        max_burst: u64,
+    ) -> Result<(), ContractError> {
+        let key = DataKey::IssuerRateLimit(issuer.clone());
+        let current_time = env.ledger().timestamp() as u64;
+
+        let mut state = env
+            .storage()
+            .persistent()
+            .get::<DataKey, RateLimitState>(&key)
+            .unwrap_or_else(|| RateLimitState {
+                tokens: max_burst,
+                last_refill_secs: current_time,
+            });
+
+        // Calculate elapsed time and refill tokens
+        let elapsed = current_time.saturating_sub(state.last_refill_secs);
+        let refilled_tokens = state
+            .tokens
+            .saturating_add(elapsed.saturating_mul(refill_rate))
+            .min(max_burst);
+
+        state.tokens = refilled_tokens;
+        state.last_refill_secs = current_time;
+
+        // Try to consume cost
+        if state.tokens >= cost {
+            state.tokens -= cost;
+            env.storage().persistent().set(&key, &state);
+            Ok(())
+        } else {
+            Err(ContractError::RateLimitExceeded)
+        }
+    }
+
+    /// Check and consume tokens from the address's rate limit bucket.
+    ///
+    /// Uses the same token bucket algorithm as issuer limits.
+    ///
+    /// # Arguments
+    /// * `env`        - The Soroban environment
+    /// * `address`    - Address of the caller to rate-limit
+    /// * `cost`       - Tokens to consume for this operation
+    /// * `refill_rate` - Tokens added per second
+    /// * `max_burst`  - Maximum bucket capacity
+    ///
+    /// # Errors
+    /// * [`ContractError::RateLimitExceeded`] — if insufficient tokens are available
+    fn check_address_rate_limit(
+        env: &Env,
+        address: &Address,
+        cost: u64,
+        refill_rate: u64,
+        max_burst: u64,
+    ) -> Result<(), ContractError> {
+        let key = DataKey::AddressRateLimit(address.clone());
+        let current_time = env.ledger().timestamp() as u64;
+
+        let mut state = env
+            .storage()
+            .persistent()
+            .get::<DataKey, RateLimitState>(&key)
+            .unwrap_or_else(|| RateLimitState {
+                tokens: max_burst,
+                last_refill_secs: current_time,
+            });
+
+        // Calculate elapsed time and refill tokens
+        let elapsed = current_time.saturating_sub(state.last_refill_secs);
+        let refilled_tokens = state
+            .tokens
+            .saturating_add(elapsed.saturating_mul(refill_rate))
+            .min(max_burst);
+
+        state.tokens = refilled_tokens;
+        state.last_refill_secs = current_time;
+
+        // Try to consume cost
+        if state.tokens >= cost {
+            state.tokens -= cost;
+            env.storage().persistent().set(&key, &state);
+            Ok(())
+        } else {
+            Err(ContractError::RateLimitExceeded)
+        }
+    }
+
     /// Registers a new document on-chain, associating it with an issuer and owner.
     ///
     /// The issuer must authorize this call. Each document hash can only be registered once.
