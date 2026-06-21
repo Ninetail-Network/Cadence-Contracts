@@ -370,7 +370,8 @@ impl ProofStellContract {
     /// Revokes a previously registered document, preventing future verification.
     ///
     /// Only the original issuer of the document may revoke it. A document that has
-    /// already been revoked cannot be revoked again.
+    /// already been revoked cannot be revoked again. Rate limits are enforced per issuer
+    /// to prevent revocation spam.
     ///
     /// # Arguments
     /// * `env`           - The Soroban environment
@@ -384,6 +385,7 @@ impl ProofStellContract {
     /// * [`ContractError::DocumentNotFound`]    — if no record exists for this hash
     /// * [`ContractError::OnlyIssuerCanRevoke`] — if the caller is not the original issuer
     /// * [`ContractError::AlreadyRevoked`]      — if the document is already revoked
+    /// * [`ContractError::RateLimitExceeded`]   — if issuer has exceeded rate limits
     pub fn revoke_document(
         env: Env,
         issuer: Address,
@@ -391,6 +393,17 @@ impl ProofStellContract {
     ) -> Result<DocumentRecord, ContractError> {
         issuer.require_auth();
 
+        // ── Rate limit check ──
+        // Only check issuer rate limit for revocation (not address, as revocation is issuer-initiated)
+        Self::check_issuer_rate_limit(
+            &env,
+            &issuer,
+            OPERATION_COST,
+            ISSUER_RATE_LIMIT_PER_SECOND,
+            ISSUER_RATE_LIMIT_BURST,
+        )?;
+
+        // ── Document revocation ──
         let key = DataKey::Document(document_hash.clone());
 
         let mut record: DocumentRecord = env
