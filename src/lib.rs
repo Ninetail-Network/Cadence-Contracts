@@ -594,4 +594,175 @@ mod tests {
 
         assert!(client.document_exists(&document_hash));
     }
+
+    // ── Rate limiting tests ──────────────────────────────────────────────
+
+    #[test]
+    fn register_respects_issuer_rate_limit_burst() {
+        let (env, client, issuer, owner, _) = setup();
+
+        // Create and register documents up to the issuer burst limit
+        for i in 0..ISSUER_RATE_LIMIT_BURST {
+            let hash = BytesN::from_array(&env, &[i as u8; 32]);
+            let result = client.try_register_document(&issuer, &owner, &hash);
+            assert!(result.is_ok(), "registration {} should succeed", i);
+        }
+
+        // Attempt one more registration should fail (burst exhausted)
+        let hash = BytesN::from_array(&env, &[255; 32]);
+        let err = client
+            .try_register_document(&issuer, &owner, &hash)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::RateLimitExceeded);
+    }
+
+    #[test]
+    fn register_respects_address_rate_limit_burst() {
+        let (env, client, issuer, owner, _) = setup();
+
+        // Create documents using the same owner up to the address burst limit
+        for i in 0..ADDRESS_RATE_LIMIT_BURST {
+            let hash = BytesN::from_array(&env, &[i as u8; 32]);
+            let different_issuer = Address::generate(&env);
+            let result = client.try_register_document(&different_issuer, &owner, &hash);
+            assert!(result.is_ok(), "registration {} should succeed", i);
+        }
+
+        // Attempt one more registration with same owner should fail
+        let hash = BytesN::from_array(&env, &[255; 32]);
+        let different_issuer = Address::generate(&env);
+        let err = client
+            .try_register_document(&different_issuer, &owner, &hash)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::RateLimitExceeded);
+    }
+
+    #[test]
+    fn revoke_respects_issuer_rate_limit_burst() {
+        let (env, client, issuer, owner, _) = setup();
+
+        // Register documents for revocation (using different issuers to avoid registration limit)
+        let mut document_hashes = Vec::new();
+        for i in 0..ISSUER_RATE_LIMIT_BURST {
+            let hash = BytesN::from_array(&env, &[i as u8; 32]);
+            client.register_document(&issuer, &owner, &hash);
+            document_hashes.push(hash);
+        }
+
+        // Revoke all documents
+        for (i, hash) in document_hashes.iter().enumerate() {
+            let result = client.try_revoke_document(&issuer, hash);
+            assert!(result.is_ok(), "revocation {} should succeed", i);
+        }
+
+        // Attempt one more revocation should fail (burst exhausted)
+        // Create and register a new document, then try to revoke
+        let new_hash = BytesN::from_array(&env, &[255; 32]);
+        client.register_document(&issuer, &owner, &new_hash);
+        let err = client
+            .try_revoke_document(&issuer, &new_hash)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::RateLimitExceeded);
+    }
+
+    #[test]
+    fn per_issuer_rate_limits_are_independent() {
+        let (env, client, _issuer, owner, _) = setup();
+
+        let issuer1 = Address::generate(&env);
+        let issuer2 = Address::generate(&env);
+
+        // Issuer 1 exhausts its burst
+        for i in 0..ISSUER_RATE_LIMIT_BURST {
+            let hash = BytesN::from_array(&env, &[i as u8; 32]);
+            let result = client.try_register_document(&issuer1, &owner, &hash);
+            assert!(result.is_ok());
+        }
+
+        // Issuer 2 should still be able to register despite issuer 1's limit
+        let hash = BytesN::from_array(&env, &[200; 32]);
+        let result = client.try_register_document(&issuer2, &owner, &hash);
+        assert!(result.is_ok());
+
+        // Issuer 1 should still be rate limited
+        let hash = BytesN::from_array(&env, &[201; 32]);
+        let err = client
+            .try_register_document(&issuer1, &owner, &hash)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::RateLimitExceeded);
+    }
+
+    #[test]
+    fn per_address_rate_limits_are_independent() {
+        let (env, client, issuer, _owner, _) = setup();
+
+        let owner1 = Address::generate(&env);
+        let owner2 = Address::generate(&env);
+
+        // Owner 1 exhausts its burst
+        for i in 0..ADDRESS_RATE_LIMIT_BURST {
+            let hash = BytesN::from_array(&env, &[i as u8; 32]);
+            let result = client.try_register_document(&issuer, &owner1, &hash);
+            assert!(result.is_ok());
+        }
+
+        // Owner 2 should still be able to register despite owner 1's limit
+        let hash = BytesN::from_array(&env, &[200; 32]);
+        let result = client.try_register_document(&issuer, &owner2, &hash);
+        assert!(result.is_ok());
+
+        // Owner 1 should still be rate limited
+        let hash = BytesN::from_array(&env, &[201; 32]);
+        let err = client
+            .try_register_document(&issuer, &owner1, &hash)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::RateLimitExceeded);
+    }
+
+    #[test]
+    fn register_and_revoke_can_proceed_when_within_burst() {
+        let (env, client, issuer, owner, document_hash) = setup();
+
+        // Register and revoke should both work when within burst limits
+        let record = client.register_document(&issuer, &owner, &document_hash);
+        assert_eq!(record.status, DocumentStatus::Active);
+
+        let revoked = client.revoke_document(&issuer, &document_hash);
+        assert_eq!(revoked.status, DocumentStatus::Revoked);
+    }
+
+    #[test]
+    fn issuer_limit_blocks_both_register_and_revoke() {
+        let (env, client, issuer, owner, _) = setup();
+
+        // Exhaust issuer's burst limit with registrations
+        for i in 0..ISSUER_RATE_LIMIT_BURST {
+            let hash = BytesN::from_array(&env, &[i as u8; 32]);
+            client.register_document(&issuer, &owner, &hash);
+        }
+
+        // Try to register one more (should fail)
+        let hash1 = BytesN::from_array(&env, &[200; 32]);
+        let err = client
+            .try_register_document(&issuer, &owner, &hash1)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::RateLimitExceeded);
+
+        // Try to revoke (should also fail)
+        let hash_to_revoke = BytesN::from_array(&env, &[0; 32]);
+        let err = client
+            .try_revoke_document(&issuer, &hash_to_revoke)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::RateLimitExceeded);
+    }
 }
