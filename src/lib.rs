@@ -549,7 +549,7 @@ mod tests {
 
     #[test]
     fn get_document_status_returns_not_found_for_missing_document() {
-        let (_env, client, _issuer, _owner, document_hash) = setup();
+        let (env, client, issuer, owner, document_hash) = setup();
 
         let err = client
             .try_get_document_status(&document_hash)
