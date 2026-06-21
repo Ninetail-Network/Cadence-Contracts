@@ -436,6 +436,7 @@ impl ProofStellContract {
 #[cfg(test)]
 mod tests {
     extern crate std;
+    use std::vec::Vec;
 
     use super::*;
     use soroban_sdk::{testutils::Address as _, Address, Env};
@@ -599,7 +600,7 @@ mod tests {
 
     #[test]
     fn register_respects_issuer_rate_limit_burst() {
-        let (env, client, issuer, owner, _) = setup();
+        let (_env, _client, _issuer, _owner, _) = setup();
 
         // Create and register documents up to the issuer burst limit
         for i in 0..ISSUER_RATE_LIMIT_BURST {
