@@ -188,6 +188,7 @@ impl ProofStellContract {
     ///
     /// # Errors
     /// * [`ContractError::AlreadyRegistered`] — if a record already exists for this hash
+    /// * [`ContractError::RateLimitExceeded`] — if the issuer has exceeded their rate limit
     pub fn register_document(
         env: Env,
         issuer: Address,
@@ -195,6 +196,9 @@ impl ProofStellContract {
         document_hash: BytesN<32>,
     ) -> Result<DocumentRecord, ContractError> {
         issuer.require_auth();
+
+        // Check rate limit before processing
+        Self::check_and_update_rate_limit(&env, issuer.clone(), 1)?;
 
         let key = DataKey::Document(document_hash.clone());
 
@@ -646,19 +650,28 @@ impl ProofStellContract {
     /// If tokens are available, they are consumed and the function returns Ok(()).
     /// If the limit is exceeded, returns RateLimitExceeded.
     ///
+    /// Rate limit configuration is stored globally in the contract; if not set,
+    /// defaults to 100 operations per second with 100 burst allowance.
+    ///
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `issuer` - The issuer address to rate limit
     /// * `tokens_needed` - Number of tokens to consume (usually 1 per operation, or batch size)
-    /// * `per_second` - Rate limit: tokens per second for this issuer
-    /// * `burst` - Maximum burst allowance (initial and refilled cap)
     fn check_and_update_rate_limit(
         env: Env,
         issuer: Address,
         tokens_needed: u32,
-        per_second: u32,
-        burst: u32,
     ) -> Result<(), ContractError> {
+        // Retrieve rate limit config or use defaults
+        let config: RateLimitConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RateLimitConfig)
+            .unwrap_or(RateLimitConfig {
+                per_second: 100,
+                burst: 100,
+            });
+
         let current_timestamp = env.ledger().timestamp();
         let rate_limit_key = DataKey::IssuerRateLimit(issuer.clone());
 
@@ -668,18 +681,18 @@ impl ProofStellContract {
             .persistent()
             .get(&rate_limit_key)
             .unwrap_or_else(|| IssuerRateLimitData {
-                available_tokens: burst,
+                available_tokens: config.burst,
                 last_refill_timestamp: current_timestamp,
             });
 
         // Calculate refilled tokens based on elapsed time
         if current_timestamp > rate_limit_data.last_refill_timestamp {
             let elapsed_seconds = (current_timestamp - rate_limit_data.last_refill_timestamp) as u32;
-            let tokens_to_add = elapsed_seconds.saturating_mul(per_second);
+            let tokens_to_add = elapsed_seconds.saturating_mul(config.per_second);
             rate_limit_data.available_tokens = rate_limit_data
                 .available_tokens
                 .saturating_add(tokens_to_add)
-                .min(burst);
+                .min(config.burst);
             rate_limit_data.last_refill_timestamp = current_timestamp;
         }
 
@@ -696,7 +709,58 @@ impl ProofStellContract {
 
         Ok(())
     }
-}
+
+    /// Set the global rate limit configuration (admin only).
+    ///
+    /// Allows the contract admin to adjust rate limits without a full upgrade.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `admin` - The admin address (must authorize and match stored admin)
+    /// * `per_second` - New rate limit in operations per second
+    /// * `burst` - New burst allowance
+    ///
+    /// # Errors
+    /// * [`ContractError::NotInitialized`] — if the contract has not been initialized
+    /// * [`ContractError::Unauthorized`]   — if the caller is not the stored admin
+    pub fn set_rate_limit_config(
+        env: Env,
+        admin: Address,
+        per_second: u32,
+        burst: u32,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+
+        let stored_admin = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .ok_or(ContractError::NotInitialized)?;
+
+        if stored_admin != admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        let config = RateLimitConfig { per_second, burst };
+        env.storage()
+            .persistent()
+            .set(&DataKey::RateLimitConfig, &config);
+
+        Ok(())
+    }
+
+    /// Get the current rate limit configuration.
+    ///
+    /// Returns the configured per-issuer rate limits, or defaults if not yet set.
+    pub fn get_rate_limit_config(env: Env) -> RateLimitConfig {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RateLimitConfig)
+            .unwrap_or(RateLimitConfig {
+                per_second: 100,
+                burst: 100,
+            })
+    }
 
 #[cfg(test)]
 mod tests {
