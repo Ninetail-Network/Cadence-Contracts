@@ -2,6 +2,7 @@
 
 // The service-side modules require std and are only available on non-WASM targets.
 #[cfg(not(target_arch = "wasm32"))]
+#[macro_use]
 extern crate std;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -22,6 +23,7 @@ pub mod rate_limit;
 pub mod stellar;
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
+    Symbol, Vec,
 };
 
 #[contracttype]
@@ -58,7 +60,21 @@ pub enum DataKey {
     IssuerRateLimit(Address),
     /// Per-address (owner) rate limit state
     AddressRateLimit(Address),
+    Admin,
+    Version,
+    FeatureFlag(Symbol),
 }
+
+pub const CONTRACT_VERSION: u32 = 1;
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DocumentInfo {
+    pub owner: Address,
+    pub document_hash: BytesN<32>,
+}
+
+pub const MAX_BATCH_SIZE: u32 = 20;
 
 /// Enumeration of all error conditions that can occur within the ProofStell contract.
 ///
@@ -74,7 +90,20 @@ pub enum DataKey {
 /// | `AlreadyRevoked`       | 4    | The document has already been revoked                    |
 /// | `InvalidOwner`         | 5    | The provided owner address is not valid for this op      |
 /// | `InvalidIssuer`        | 6    | The provided issuer address is not valid for this op     |
-/// | `RateLimitExceeded`    | 7    | Operation would exceed rate limit quota                  |
+    /// Rate limit exceeded; caller should retry after delay. Code: 7
+    RateLimitExceeded = 7,
+    /// The batch exceeds the maximum allowed size (20). Code: 8
+    BatchTooLarge = 8,
+    /// The batch is empty. Code: 9
+    BatchEmpty = 9,
+    /// The contract has already been initialized. Code: 10
+    AlreadyInitialized = 10,
+    /// The contract has not been initialized yet. Code: 11
+    NotInitialized = 11,
+    /// The caller is not the authorized admin. Code: 12
+    Unauthorized = 12,
+    /// The contract is already at the latest version; no migration is needed. Code: 13
+    MigrationNotNeeded = 13,
 #[contracterror]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContractError {
@@ -92,6 +121,18 @@ pub enum ContractError {
     InvalidIssuer = 6,
     /// Rate limit exceeded; caller should retry after delay. Code: 7
     RateLimitExceeded = 7,
+    /// The batch exceeds the maximum allowed size (20). Code: 8
+    BatchTooLarge = 8,
+    /// The batch is empty. Code: 9
+    BatchEmpty = 9,
+    /// The contract has already been initialized. Code: 10
+    AlreadyInitialized = 10,
+    /// The contract has not been initialized yet. Code: 11
+    NotInitialized = 11,
+    /// The caller is not the authorized admin. Code: 12
+    Unauthorized = 12,
+    /// The contract is already at the latest version; no migration is needed. Code: 13
+    MigrationNotNeeded = 13,
 }
 
 #[contractevent(topics = ["register"], data_format = "vec")]
@@ -107,6 +148,21 @@ pub struct DocumentRevoked {
     #[topic]
     pub issuer: Address,
     pub document_hash: BytesN<32>,
+}
+
+#[contractevent(topics = ["init"], data_format = "vec")]
+pub struct ContractInitialized {
+    #[topic]
+    pub admin: Address,
+    pub version: u32,
+}
+
+#[contractevent(topics = ["upgrade"], data_format = "vec")]
+pub struct ContractUpgraded {
+    #[topic]
+    pub admin: Address,
+    pub old_version: u32,
+    pub new_version: u32,
 }
 
 #[contract]
@@ -431,6 +487,312 @@ impl ProofStellContract {
 
         Ok(record)
     }
+
+    /// Registers multiple documents in a single atomic transaction.
+    ///
+    /// The issuer authorizes once for the entire batch. All documents must be
+    /// valid or the entire batch fails — no partial state is written.
+    ///
+    /// # Arguments
+    /// * `env`       - The Soroban environment
+    /// * `issuer`    - Address of the entity registering the documents (must authorize)
+    /// * `documents` - Vector of [`DocumentInfo`] (owner + hash pairs), max 20 items
+    ///
+    /// # Returns
+    /// A vector of newly created [`DocumentRecord`]s, all with `DocumentStatus::Active`
+    ///
+    /// # Errors
+    /// * [`ContractError::BatchEmpty`]       — if the vector is empty
+    /// * [`ContractError::BatchTooLarge`]    — if the vector exceeds 20 items
+    /// * [`ContractError::AlreadyRegistered`] — if any document hash is already registered
+    pub fn batch_register_documents(
+        env: Env,
+        issuer: Address,
+        documents: Vec<DocumentInfo>,
+    ) -> Result<Vec<DocumentRecord>, ContractError> {
+        issuer.require_auth();
+
+        if documents.is_empty() {
+            return Err(ContractError::BatchEmpty);
+        }
+        if documents.len() > MAX_BATCH_SIZE {
+            return Err(ContractError::BatchTooLarge);
+        }
+
+        let mut records = Vec::new(&env);
+
+        for doc in documents.iter() {
+            let key = DataKey::Document(doc.document_hash.clone());
+
+            if env.storage().persistent().has(&key) {
+                return Err(ContractError::AlreadyRegistered);
+            }
+
+            let record = DocumentRecord {
+                issuer: issuer.clone(),
+                owner: doc.owner.clone(),
+                timestamp: env.ledger().timestamp(),
+                status: DocumentStatus::Active,
+            };
+
+            env.storage().persistent().set(&key, &record);
+            DocumentRegistered {
+                issuer: issuer.clone(),
+                owner: doc.owner.clone(),
+                document_hash: doc.document_hash.clone(),
+            }
+            .publish(&env);
+
+            records.push_back(record);
+        }
+
+        Ok(records)
+    }
+
+    /// Revokes multiple documents in a single atomic transaction.
+    ///
+    /// The issuer authorizes once for the entire batch. All documents must be
+    /// revocable or the entire batch fails — no partial state is written.
+    ///
+    /// # Arguments
+    /// * `env`            - The Soroban environment
+    /// * `issuer`         - Address of the original issuer (must authorize)
+    /// * `document_hashes` - Vector of 32-byte document hashes to revoke, max 20 items
+    ///
+    /// # Returns
+    /// A vector of updated [`DocumentRecord`]s, all with `DocumentStatus::Revoked`
+    ///
+    /// # Errors
+    /// * [`ContractError::BatchEmpty`]          — if the vector is empty
+    /// * [`ContractError::BatchTooLarge`]       — if the vector exceeds 20 items
+    /// * [`ContractError::DocumentNotFound`]    — if any hash has no record
+    /// * [`ContractError::OnlyIssuerCanRevoke`] — if the caller is not the original issuer of any document
+    /// * [`ContractError::AlreadyRevoked`]      — if any document is already revoked
+    pub fn batch_revoke_documents(
+        env: Env,
+        issuer: Address,
+        document_hashes: Vec<BytesN<32>>,
+    ) -> Result<Vec<DocumentRecord>, ContractError> {
+        issuer.require_auth();
+
+        if document_hashes.is_empty() {
+            return Err(ContractError::BatchEmpty);
+        }
+        if document_hashes.len() > MAX_BATCH_SIZE {
+            return Err(ContractError::BatchTooLarge);
+        }
+
+        let mut records = Vec::new(&env);
+
+        for document_hash in document_hashes.iter() {
+            let key = DataKey::Document(document_hash.clone());
+
+            let mut record: DocumentRecord = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .ok_or(ContractError::DocumentNotFound)?;
+
+            if record.issuer != issuer {
+                return Err(ContractError::OnlyIssuerCanRevoke);
+            }
+
+            if record.status == DocumentStatus::Revoked {
+                return Err(ContractError::AlreadyRevoked);
+            }
+
+            record.status = DocumentStatus::Revoked;
+            env.storage().persistent().set(&key, &record);
+            DocumentRevoked {
+                issuer: issuer.clone(),
+                document_hash: document_hash.clone(),
+            }
+            .publish(&env);
+
+            records.push_back(record);
+        }
+
+        Ok(records)
+    }
+
+    /// Initializes the contract for a new deployment, setting the admin and contract version.
+    ///
+    /// Must be called once after deployment. Subsequent calls return `AlreadyInitialized`.
+    ///
+    /// # Arguments
+    /// * `env`   - The Soroban environment
+    /// * `admin` - Address that will govern future upgrades and migrations (must authorize)
+    ///
+    /// # Errors
+    /// * [`ContractError::AlreadyInitialized`] — if the contract has already been initialized
+    pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
+        admin.require_auth();
+
+        if env.storage().persistent().has(&DataKey::Version) {
+            return Err(ContractError::AlreadyInitialized);
+        }
+
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Version, &CONTRACT_VERSION);
+
+        ContractInitialized {
+            admin,
+            version: CONTRACT_VERSION,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns the current contract version stored in ledger (0 if not initialized).
+    pub fn get_version(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::Version)
+            .unwrap_or(0)
+    }
+
+    /// Returns the stored admin address, or `None` if the contract is not yet initialized.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().persistent().get::<DataKey, Address>(&DataKey::Admin)
+    }
+
+    /// Upgrades the contract WASM to the given hash.
+    ///
+    /// The new WASM must already be uploaded to the Stellar ledger. After this call,
+    /// subsequent invocations will execute the new WASM. Call `migrate` afterwards
+    /// to apply any data transformations required by the new version.
+    ///
+    /// # Arguments
+    /// * `env`          - The Soroban environment
+    /// * `admin`        - The governance admin address (must authorize and match stored admin)
+    /// * `new_wasm_hash` - 32-byte hash of the uploaded WASM binary
+    ///
+    /// # Errors
+    /// * [`ContractError::NotInitialized`] — if the contract has not been initialized
+    /// * [`ContractError::Unauthorized`]   — if the caller is not the stored admin
+    pub fn upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+
+        let stored_admin = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .ok_or(ContractError::NotInitialized)?;
+
+        if stored_admin != admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        let old_version = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::Version)
+            .unwrap_or(0);
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+
+        ContractUpgraded {
+            admin,
+            old_version,
+            new_version: old_version,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Migrates contract state to the current version.
+    ///
+    /// Detects the stored version and applies the appropriate data transformation:
+    /// - Version 0 (pre-versioning): stores the admin and sets version to 1. This handles
+    ///   existing deployments that were upgraded without a prior `initialize` call.
+    /// - Version 1 (current): already up to date; returns `MigrationNotNeeded`.
+    ///
+    /// # Arguments
+    /// * `env`   - The Soroban environment
+    /// * `admin` - Must authorize; used as admin address when migrating from version 0
+    ///
+    /// # Returns
+    /// The version number after migration
+    ///
+    /// # Errors
+    /// * [`ContractError::Unauthorized`]     — if caller does not match stored admin (v1+)
+    /// * [`ContractError::MigrationNotNeeded`] — if already at the latest version
+    pub fn migrate(env: Env, admin: Address) -> Result<u32, ContractError> {
+        admin.require_auth();
+
+        let current_version = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::Version)
+            .unwrap_or(0);
+
+        match current_version {
+            0 => {
+                // Pre-versioned state: bootstrap versioning without requiring prior initialize.
+                // The admin arg becomes the stored admin for all future governance calls.
+                env.storage().persistent().set(&DataKey::Admin, &admin);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Version, &CONTRACT_VERSION);
+                Ok(CONTRACT_VERSION)
+            }
+            _ => Err(ContractError::MigrationNotNeeded),
+        }
+    }
+
+    /// Sets a named feature flag.
+    ///
+    /// Feature flags allow toggling contract behaviours without a full WASM upgrade.
+    ///
+    /// # Arguments
+    /// * `env`     - The Soroban environment
+    /// * `admin`   - The governance admin address (must authorize and match stored admin)
+    /// * `flag`    - The flag name as a `Symbol`
+    /// * `enabled` - `true` to enable, `false` to disable
+    ///
+    /// # Errors
+    /// * [`ContractError::NotInitialized`] — if the contract has not been initialized
+    /// * [`ContractError::Unauthorized`]   — if the caller is not the stored admin
+    pub fn set_feature_flag(
+        env: Env,
+        admin: Address,
+        flag: Symbol,
+        enabled: bool,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+
+        let stored_admin = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .ok_or(ContractError::NotInitialized)?;
+
+        if stored_admin != admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::FeatureFlag(flag), &enabled);
+
+        Ok(())
+    }
+
+    /// Returns the value of a named feature flag (`false` if not set).
+    pub fn get_feature_flag(env: Env, flag: Symbol) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::FeatureFlag(flag))
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
@@ -596,6 +958,7 @@ mod tests {
         assert!(client.document_exists(&document_hash));
     }
 
+<<<<<<< HEAD
     // ── Rate limiting tests ──────────────────────────────────────────────
 
     #[test]
@@ -693,3 +1056,359 @@ mod tests {
         assert!(result.is_ok());
     }
 }
+=======
+    // --- batch_register_documents ---
+
+    #[test]
+    fn batch_register_all_succeed() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let docs = soroban_sdk::vec![
+            &env,
+            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[1; 32]) },
+            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[2; 32]) },
+            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[3; 32]) },
+        ];
+
+        let records = client.batch_register_documents(&issuer, &docs);
+
+        assert_eq!(records.len(), 3);
+        for record in records.iter() {
+            assert_eq!(record.status, DocumentStatus::Active);
+            assert_eq!(record.issuer, issuer);
+        }
+    }
+
+    #[test]
+    fn batch_register_fails_on_duplicate() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hash1 = BytesN::from_array(&env, &[1; 32]);
+        let hash2 = BytesN::from_array(&env, &[2; 32]);
+        client.register_document(&issuer, &owner, &hash1);
+
+        let docs = soroban_sdk::vec![
+            &env,
+            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[3; 32]) },
+            DocumentInfo { owner: owner.clone(), document_hash: hash1.clone() },
+            DocumentInfo { owner: owner.clone(), document_hash: hash2.clone() },
+        ];
+
+        let err = client
+            .try_batch_register_documents(&issuer, &docs)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::AlreadyRegistered);
+        // hash2 must not have been stored (batch was atomic)
+        assert!(!client.document_exists(&hash2));
+    }
+
+    #[test]
+    fn batch_register_rejects_empty() {
+        let (env, client, issuer, _, _) = setup();
+
+        let docs: soroban_sdk::Vec<DocumentInfo> = soroban_sdk::vec![&env];
+        let err = client
+            .try_batch_register_documents(&issuer, &docs)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::BatchEmpty);
+    }
+
+    #[test]
+    fn batch_register_rejects_oversized() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let mut docs = soroban_sdk::vec![&env];
+        for i in 0..21u8 {
+            docs.push_back(DocumentInfo {
+                owner: owner.clone(),
+                document_hash: BytesN::from_array(&env, &[i; 32]),
+            });
+        }
+
+        let err = client
+            .try_batch_register_documents(&issuer, &docs)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::BatchTooLarge);
+    }
+
+    // --- batch_revoke_documents ---
+
+    #[test]
+    fn batch_revoke_all_succeed() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hashes = [
+            BytesN::from_array(&env, &[1; 32]),
+            BytesN::from_array(&env, &[2; 32]),
+            BytesN::from_array(&env, &[3; 32]),
+        ];
+        for h in &hashes {
+            client.register_document(&issuer, &owner, h);
+        }
+
+        let hash_vec = soroban_sdk::vec![&env, hashes[0].clone(), hashes[1].clone(), hashes[2].clone()];
+        let records = client.batch_revoke_documents(&issuer, &hash_vec);
+
+        assert_eq!(records.len(), 3);
+        for record in records.iter() {
+            assert_eq!(record.status, DocumentStatus::Revoked);
+        }
+    }
+
+    #[test]
+    fn batch_revoke_fails_on_missing() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hash1 = BytesN::from_array(&env, &[1; 32]);
+        let hash_missing = BytesN::from_array(&env, &[99; 32]);
+        client.register_document(&issuer, &owner, &hash1);
+
+        let hash_vec = soroban_sdk::vec![&env, hash1.clone(), hash_missing];
+        let err = client
+            .try_batch_revoke_documents(&issuer, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::DocumentNotFound);
+        // hash1 must still be Active (batch was atomic)
+        assert_eq!(client.get_document_status(&hash1), DocumentStatus::Active);
+    }
+
+    #[test]
+    fn batch_revoke_fails_on_wrong_issuer() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hash1 = BytesN::from_array(&env, &[1; 32]);
+        let hash2 = BytesN::from_array(&env, &[2; 32]);
+        client.register_document(&issuer, &owner, &hash1);
+        client.register_document(&issuer, &owner, &hash2);
+
+        let other = Address::generate(&env);
+        let hash_vec = soroban_sdk::vec![&env, hash1.clone(), hash2.clone()];
+        let err = client
+            .try_batch_revoke_documents(&other, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::OnlyIssuerCanRevoke);
+        assert_eq!(client.get_document_status(&hash1), DocumentStatus::Active);
+    }
+
+    #[test]
+    fn batch_revoke_fails_on_already_revoked() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hash1 = BytesN::from_array(&env, &[1; 32]);
+        let hash2 = BytesN::from_array(&env, &[2; 32]);
+        client.register_document(&issuer, &owner, &hash1);
+        client.register_document(&issuer, &owner, &hash2);
+        client.revoke_document(&issuer, &hash1);
+
+        let hash_vec = soroban_sdk::vec![&env, hash1, hash2.clone()];
+        let err = client
+            .try_batch_revoke_documents(&issuer, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::AlreadyRevoked);
+        assert_eq!(client.get_document_status(&hash2), DocumentStatus::Active);
+    }
+
+    #[test]
+    fn batch_revoke_rejects_empty() {
+        let (_env, client, issuer, _, _) = setup();
+
+        let hash_vec: soroban_sdk::Vec<BytesN<32>> = soroban_sdk::vec![&_env];
+        let err = client
+            .try_batch_revoke_documents(&issuer, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::BatchEmpty);
+    }
+
+    #[test]
+    fn batch_revoke_rejects_oversized() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let mut hash_vec: soroban_sdk::Vec<BytesN<32>> = soroban_sdk::vec![&env];
+        for i in 0..21u8 {
+            let h = BytesN::from_array(&env, &[i; 32]);
+            client.register_document(&issuer, &owner, &h);
+            hash_vec.push_back(h);
+        }
+
+        let err = client
+            .try_batch_revoke_documents(&issuer, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::BatchTooLarge);
+    }
+
+    // --- initialize / get_version / get_admin ---
+
+    #[test]
+    fn initialize_sets_admin_and_version() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        assert_eq!(client.get_version(), 1);
+        assert_eq!(client.get_admin(), Some(admin));
+    }
+
+    #[test]
+    fn get_version_returns_zero_before_init() {
+        let (_env, client, _, _, _) = setup();
+        assert_eq!(client.get_version(), 0);
+    }
+
+    #[test]
+    fn get_admin_returns_none_before_init() {
+        let (_env, client, _, _, _) = setup();
+        assert_eq!(client.get_admin(), None);
+    }
+
+    #[test]
+    fn double_initialize_fails() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        let err = client.try_initialize(&admin).unwrap_err().unwrap();
+        assert_eq!(err, ContractError::AlreadyInitialized);
+    }
+
+    // --- upgrade ---
+
+    #[test]
+    fn upgrade_requires_initialization() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+        let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        let err = client
+            .try_upgrade(&admin, &wasm_hash)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::NotInitialized);
+    }
+
+    #[test]
+    fn non_admin_cannot_upgrade() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+        let other = Address::generate(&env);
+        let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        client.initialize(&admin);
+
+        let err = client
+            .try_upgrade(&other, &wasm_hash)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::Unauthorized);
+    }
+
+    // --- migrate ---
+
+    #[test]
+    fn migrate_v0_to_v1_sets_versioning() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+
+        // Simulate pre-versioned state: no initialize called, DataKey::Version absent.
+        let new_version = client.migrate(&admin);
+
+        assert_eq!(new_version, 1);
+        assert_eq!(client.get_version(), 1);
+        assert_eq!(client.get_admin(), Some(admin));
+    }
+
+    #[test]
+    fn migrate_already_current_fails() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        let err = client.try_migrate(&admin).unwrap_err().unwrap();
+        assert_eq!(err, ContractError::MigrationNotNeeded);
+    }
+
+    #[test]
+    fn documents_still_work_after_migration() {
+        let (env, client, issuer, owner, document_hash) = setup();
+        let admin = Address::generate(&env);
+
+        // Register a document before any versioning is set up.
+        client.register_document(&issuer, &owner, &document_hash);
+
+        // Migrate from v0 to v1.
+        client.migrate(&admin);
+
+        // Document still verifiable after migration.
+        assert!(client.verify_document(&document_hash));
+        assert_eq!(client.get_document_status(&document_hash), DocumentStatus::Active);
+    }
+
+    // --- feature flags ---
+
+    #[test]
+    fn get_feature_flag_returns_false_for_unset() {
+        let (env, client, _, _, _) = setup();
+        let flag = Symbol::new(&env, "batch_ops");
+        assert!(!client.get_feature_flag(&flag));
+    }
+
+    #[test]
+    fn admin_can_set_and_get_feature_flag() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+        let flag = Symbol::new(&env, "batch_ops");
+
+        client.initialize(&admin);
+        client.set_feature_flag(&admin, &flag, &true);
+
+        assert!(client.get_feature_flag(&flag));
+    }
+
+    #[test]
+    fn non_admin_cannot_set_feature_flag() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+        let other = Address::generate(&env);
+        let flag = Symbol::new(&env, "batch_ops");
+
+        client.initialize(&admin);
+
+        let err = client
+            .try_set_feature_flag(&other, &flag, &true)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::Unauthorized);
+    }
+
+    #[test]
+    fn set_feature_flag_requires_initialization() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+        let flag = Symbol::new(&env, "batch_ops");
+
+        let err = client
+            .try_set_feature_flag(&admin, &flag, &true)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::NotInitialized);
+    }
+}
+>>>>>>> e0fc42a42093127d66bf07a090c78c21587a3874
