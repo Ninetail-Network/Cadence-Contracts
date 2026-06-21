@@ -81,6 +81,7 @@ pub const MAX_BATCH_SIZE: u32 = 20;
 /// | `NotInitialized`       | 10   | Governance call before `initialize`                      |
 /// | `Unauthorized`         | 11   | Caller is not the stored admin                           |
 /// | `MigrationNotNeeded`   | 12   | Contract is already at the latest version                |
+/// | `RateLimitExceeded`    | 13   | Operation exceeds rate limit for this issuer             |
 #[contracterror]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContractError {
@@ -108,6 +109,8 @@ pub enum ContractError {
     Unauthorized = 11,
     /// The contract is already at the latest version; no migration is needed. Code: 12
     MigrationNotNeeded = 12,
+    /// The operation exceeds the per-issuer rate limit. Code: 13
+    RateLimitExceeded = 13,
 }
 
 #[contractevent(topics = ["register"], data_format = "vec")]
