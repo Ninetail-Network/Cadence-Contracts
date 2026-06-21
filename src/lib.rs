@@ -112,6 +112,23 @@ pub struct DocumentRevoked {
 #[contract]
 pub struct ProofStellContract;
 
+// ── Contract-level rate limit constants ──
+// These define the token bucket parameters for rate limiting.
+// On-chain contracts cannot read environment variables, so these are fixed.
+// Adjust via contract redeployment if needed. Default values are tuned for
+// typical usage; high-volume issuers may need custom configuration.
+
+/// Per-issuer rate limit: tokens per second
+const ISSUER_RATE_LIMIT_PER_SECOND: u64 = 100;
+/// Per-issuer rate limit: burst allowance (max tokens in bucket)
+const ISSUER_RATE_LIMIT_BURST: u64 = 100;
+/// Per-address rate limit: tokens per second
+const ADDRESS_RATE_LIMIT_PER_SECOND: u64 = 50;
+/// Per-address rate limit: burst allowance (max tokens in bucket)
+const ADDRESS_RATE_LIMIT_BURST: u64 = 50;
+/// Token cost for a single operation (register, revoke, etc.)
+const OPERATION_COST: u64 = 1;
+
 #[contractimpl]
 impl ProofStellContract {
     /// Check and consume tokens from the issuer's rate limit bucket.
