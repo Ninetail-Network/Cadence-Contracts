@@ -90,20 +90,7 @@ pub const MAX_BATCH_SIZE: u32 = 20;
 /// | `AlreadyRevoked`       | 4    | The document has already been revoked                    |
 /// | `InvalidOwner`         | 5    | The provided owner address is not valid for this op      |
 /// | `InvalidIssuer`        | 6    | The provided issuer address is not valid for this op     |
-    /// Rate limit exceeded; caller should retry after delay. Code: 7
-    RateLimitExceeded = 7,
-    /// The batch exceeds the maximum allowed size (20). Code: 8
-    BatchTooLarge = 8,
-    /// The batch is empty. Code: 9
-    BatchEmpty = 9,
-    /// The contract has already been initialized. Code: 10
-    AlreadyInitialized = 10,
-    /// The contract has not been initialized yet. Code: 11
-    NotInitialized = 11,
-    /// The caller is not the authorized admin. Code: 12
-    Unauthorized = 12,
-    /// The contract is already at the latest version; no migration is needed. Code: 13
-    MigrationNotNeeded = 13,
+
 #[contracterror]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContractError {
@@ -602,6 +589,7 @@ impl ProofStellContract {
             }
 
             record.status = DocumentStatus::Revoked;
+
             env.storage().persistent().set(&key, &record);
             DocumentRevoked {
                 issuer: issuer.clone(),
@@ -609,11 +597,644 @@ impl ProofStellContract {
             }
             .publish(&env);
 
-            records.push_back(record);
+            records.push_back(record.clone());
         }
 
         Ok(records)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, BytesN as _, Ledger as _};
+    use soroban_sdk::{vec, IntoVal, Symbol};
+
+    // Define a setup function to avoid code duplication
+    fn setup() -> (
+        Env,
+        ProofStellContractClient,
+        Address,
+        Address,
+        BytesN<32>,
+    ) {
+        let env = Env::default();
+        env.ledger().with_mut(|li| {
+            li.timestamp = 12345;
+        });
+        let client = ProofStellContractClient::new(&env, &env.register_contract(None, ProofStellContract));
+        let issuer = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let document_hash = BytesN::from_array(&env, &[1; 32]);
+        (env, client, issuer, owner, document_hash)
+    }
+
+    // --- register_document ---
+
+    #[test]
+    fn register_document_succeeds() {
+        let (env, client, issuer, owner, document_hash) = setup();
+
+        let record = client.register_document(&issuer, &owner, &document_hash);
+
+        assert_eq!(record.issuer, issuer);
+        assert_eq!(record.owner, owner);
+        assert_eq!(record.status, DocumentStatus::Active);
+        assert_eq!(record.timestamp, 12345);
+
+        let stored_record = client.get_document(&document_hash).unwrap();
+        assert_eq!(stored_record, record);
+    }
+
+    #[test]
+    fn register_document_twice_fails() {
+        let (env, client, issuer, owner, document_hash) = setup();
+
+        client.register_document(&issuer, &owner, &document_hash);
+        let err = client
+            .try_register_document(&issuer, &owner, &document_hash)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::AlreadyRegistered);
+    }
+
+    #[test]
+    fn register_document_requires_issuer_auth() {
+        let (env, client, _, owner, document_hash) = setup();
+        let unauth_issuer = Address::generate(&env);
+
+        // This will panic because `unauth_issuer` did not authorize the call
+        let result = client.try_register_document(&unauth_issuer, &owner, &document_hash);
+        assert!(result.is_err());
+    }
+
+    // --- get_document ---
+
+    #[test]
+    fn get_document_not_found() {
+        let (_env, client, _, _, document_hash) = setup();
+        assert_eq!(client.get_document(&document_hash), None);
+    }
+
+    // --- verify_document ---
+
+    #[test]
+    fn verify_document_active() {
+        let (_env, client, issuer, owner, document_hash) = setup();
+        client.register_document(&issuer, &owner, &document_hash);
+        assert!(client.verify_document(&document_hash));
+    }
+
+    #[test]
+    fn verify_document_revoked() {
+        let (_env, client, issuer, owner, document_hash) = setup();
+        client.register_document(&issuer, &owner, &document_hash);
+        client.revoke_document(&issuer, &document_hash);
+        assert!(!client.verify_document(&document_hash));
+    }
+
+    #[test]
+    fn verify_document_not_found() {
+        let (_env, client, _, _, document_hash) = setup();
+        assert!(!client.verify_document(&document_hash));
+    }
+
+    // --- get_document_status ---
+
+    #[test]
+    fn get_document_status_succeeds() {
+        let (_env, client, issuer, owner, document_hash) = setup();
+        client.register_document(&issuer, &owner, &document_hash);
+        assert_eq!(
+            client.get_document_status(&document_hash),
+            Ok(DocumentStatus::Active)
+        );
+
+        client.revoke_document(&issuer, &document_hash);
+        assert_eq!(
+            client.get_document_status(&document_hash),
+            Ok(DocumentStatus::Revoked)
+        );
+    }
+
+    #[test]
+    fn get_document_status_not_found() {
+        let (_env, client, _, _, document_hash) = setup();
+        assert_eq!(
+            client.try_get_document_status(&document_hash),
+            Err(Ok(ContractError::DocumentNotFound))
+        );
+    }
+
+    // --- document_exists ---
+
+    #[test]
+    fn document_exists_is_true_for_active_and_revoked() {
+        let (_env, client, issuer, owner, document_hash) = setup();
+        client.register_document(&issuer, &owner, &document_hash);
+        assert!(client.document_exists(&document_hash));
+
+        client.revoke_document(&issuer, &document_hash);
+        assert!(client.document_exists(&document_hash));
+    }
+
+    #[test]
+    fn document_exists_is_false_for_nonexistent() {
+        let (_env, client, _, _, document_hash) = setup();
+        assert!(!client.document_exists(&document_hash));
+    }
+
+    // --- revoke_document ---
+
+    #[test]
+    fn revoke_document_succeeds() {
+        let (_env, client, issuer, owner, document_hash) = setup();
+        client.register_document(&issuer, &owner, &document_hash);
+
+        let record = client.revoke_document(&issuer, &document_hash);
+
+        assert_eq!(record.status, DocumentStatus::Revoked);
+        let stored_record = client.get_document(&document_hash).unwrap();
+        assert_eq!(stored_record.status, DocumentStatus::Revoked);
+    }
+
+    #[test]
+    fn revoke_document_not_found() {
+        let (_env, client, issuer, _, document_hash) = setup();
+        let err = client
+            .try_revoke_document(&issuer, &document_hash)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::DocumentNotFound);
+    }
+
+    #[test]
+    fn revoke_document_already_revoked() {
+        let (_env, client, issuer, owner, document_hash) = setup();
+        client.register_document(&issuer, &owner, &document_hash);
+        client.revoke_document(&issuer, &document_hash);
+
+        let err = client
+            .try_revoke_document(&issuer, &document_hash)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::AlreadyRevoked);
+    }
+
+    #[test]
+    fn revoke_document_wrong_issuer() {
+        let (env, client, issuer, owner, document_hash) = setup();
+        let other_issuer = Address::generate(&env);
+        client.register_document(&issuer, &owner, &document_hash);
+
+        let err = client
+            .try_revoke_document(&other_issuer, &document_hash)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::OnlyIssuerCanRevoke);
+    }
+
+    // --- rate limiting ---
+
+    #[test]
+    fn per_issuer_rate_limit_works() {
+        let (env, client, issuer, _, _) = setup();
+
+        // Exhaust the burst limit
+        for i in 0..ISSUER_RATE_LIMIT_BURST {
+            let hash = BytesN::from_array(&env, &[i as u8; 32]);
+            let owner = Address::generate(&env); // Use a new owner for each registration
+            client.register_document(&issuer, &owner, &hash);
+        }
+
+        // The next call should fail
+        let hash = BytesN::from_array(&env, &[255; 32]);
+        let owner = Address::generate(&env);
+        let err = client
+            .try_register_document(&issuer, &owner, &hash)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::RateLimitExceeded);
+    }
+
+    #[test]
+    fn per_address_rate_limit_works() {
+        let (env, client, _, owner, _) = setup();
+
+        // Exhaust the burst limit
+        for i in 0..ADDRESS_RATE_LIMIT_BURST {
+            let hash = BytesN::from_array(&env, &[i as u8; 32]);
+            let issuer = Address::generate(&env); // Use a new issuer for each registration
+            client.register_document(&issuer, &owner, &hash);
+        }
+
+        // The next call should fail
+        let hash = BytesN::from_array(&env, &[255; 32]);
+        let issuer = Address::generate(&env);
+        let err = client
+            .try_register_document(&issuer, &owner, &hash)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::RateLimitExceeded);
+    }
+
+    #[test]
+    fn per_issuer_rate_limits_are_independent() {
+        let (env, client, _, _owner, _) = setup();
+        let issuer1 = Address::generate(&env);
+        let issuer2 = Address::generate(&env);
+
+        // Exhaust the burst limit for the first issuer
+        for i in 0..ISSUER_RATE_LIMIT_BURST {
+            let hash = BytesN::from_array(&env, &[i as u8; 32]);
+            let owner = Address::generate(&env); // Use a new owner for each registration
+            client.register_document(&issuer1, &owner, &hash);
+        }
+
+        // The second issuer should still be able to register
+        let hash = BytesN::from_array(&env, &[255; 32]);
+        let owner = Address::generate(&env);
+        let result = client.try_register_document(&issuer2, &owner, &hash);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn per_address_rate_limits_are_independent() {
+        let (env, client, _issuer, _, _) = setup();
+        let owner1 = Address::generate(&env);
+        let owner2 = Address::generate(&env);
+
+        // Exhaust the burst limit for the first owner
+        for i in 0..ADDRESS_RATE_LIMIT_BURST {
+            let hash = BytesN::from_array(&env, &[i as u8; 32]);
+            let issuer = Address::generate(&env); // Use a new issuer for each registration
+            client.register_document(&issuer, &owner1, &hash);
+        }
+
+        // The second owner should still be able to register
+        let hash = BytesN::from_array(&env, &[255; 32]);
+        let issuer = Address::generate(&env);
+        let result = client.try_register_document(&issuer, &owner2, &hash);
+        assert!(result.is_ok());
+    }
+
+    // --- batch_register_documents ---
+
+    #[test]
+    fn batch_register_all_succeed() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let docs = soroban_sdk::vec![
+            &env,
+            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[1; 32]) },
+            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[2; 32]) },
+            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[3; 32]) },
+        ];
+
+        let records = client.batch_register_documents(&issuer, &docs);
+
+        assert_eq!(records.len(), 3);
+        for record in records.iter() {
+            assert_eq!(record.status, DocumentStatus::Active);
+            assert_eq!(record.issuer, issuer);
+        }
+    }
+
+    #[test]
+    fn batch_register_fails_on_duplicate() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hash1 = BytesN::from_array(&env, &[1; 32]);
+        let hash2 = BytesN::from_array(&env, &[2; 32]);
+        client.register_document(&issuer, &owner, &hash1);
+
+        let docs = soroban_sdk::vec![
+            &env,
+            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[3; 32]) },
+            DocumentInfo { owner: owner.clone(), document_hash: hash1.clone() },
+            DocumentInfo { owner: owner.clone(), document_hash: hash2.clone() },
+        ];
+
+        let err = client
+            .try_batch_register_documents(&issuer, &docs)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::AlreadyRegistered);
+        // hash2 must not have been stored (batch was atomic)
+        assert!(!client.document_exists(&hash2));
+    }
+
+    #[test]
+    fn batch_register_rejects_empty() {
+        let (env, client, issuer, _, _) = setup();
+
+        let docs: soroban_sdk::Vec<DocumentInfo> = soroban_sdk::vec![&env];
+        let err = client
+            .try_batch_register_documents(&issuer, &docs)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::BatchEmpty);
+    }
+
+    #[test]
+    fn batch_register_rejects_oversized() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let mut docs = soroban_sdk::vec![&env];
+        for i in 0..21u8 {
+            docs.push_back(DocumentInfo {
+                owner: owner.clone(),
+                document_hash: BytesN::from_array(&env, &[i; 32]),
+            });
+        }
+
+        let err = client
+            .try_batch_register_documents(&issuer, &docs)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::BatchTooLarge);
+    }
+
+    // --- batch_revoke_documents ---
+
+    #[test]
+    fn batch_revoke_all_succeed() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hashes = [
+            BytesN::from_array(&env, &[1; 32]),
+            BytesN::from_array(&env, &[2; 32]),
+            BytesN::from_array(&env, &[3; 32]),
+        ];
+        for h in &hashes {
+            client.register_document(&issuer, &owner, h);
+        }
+
+        let hash_vec = soroban_sdk::vec![&env, hashes[0].clone(), hashes[1].clone(), hashes[2].clone()];
+        let records = client.batch_revoke_documents(&issuer, &hash_vec);
+
+        assert_eq!(records.len(), 3);
+        for record in records.iter() {
+            assert_eq!(record.status, DocumentStatus::Revoked);
+        }
+    }
+
+    #[test]
+    fn batch_revoke_fails_on_missing() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hash1 = BytesN::from_array(&env, &[1; 32]);
+        let hash_missing = BytesN::from_array(&env, &[99; 32]);
+        client.register_document(&issuer, &owner, &hash1);
+
+        let hash_vec = soroban_sdk::vec![&env, hash1.clone(), hash_missing];
+        let err = client
+            .try_batch_revoke_documents(&issuer, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::DocumentNotFound);
+        // hash1 must still be Active (batch was atomic)
+        assert_eq!(client.get_document_status(&hash1), DocumentStatus::Active);
+    }
+
+    #[test]
+    fn batch_revoke_fails_on_wrong_issuer() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hash1 = BytesN::from_array(&env, &[1; 32]);
+        let hash2 = BytesN::from_array(&env, &[2; 32]);
+        client.register_document(&issuer, &owner, &hash1);
+        client.register_document(&issuer, &owner, &hash2);
+
+        let other = Address::generate(&env);
+        let hash_vec = soroban_sdk::vec![&env, hash1.clone(), hash2.clone()];
+        let err = client
+            .try_batch_revoke_documents(&other, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::OnlyIssuerCanRevoke);
+        assert_eq!(client.get_document_status(&hash1), DocumentStatus::Active);
+    }
+
+    #[test]
+    fn batch_revoke_fails_on_already_revoked() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hash1 = BytesN::from_array(&env, &[1; 32]);
+        let hash2 = BytesN::from_array(&env, &[2; 32]);
+        client.register_document(&issuer, &owner, &hash1);
+        client.register_document(&issuer, &owner, &hash2);
+        client.revoke_document(&issuer, &hash1);
+
+        let hash_vec = soroban_sdk::vec![&env, hash1, hash2.clone()];
+        let err = client
+            .try_batch_revoke_documents(&issuer, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::AlreadyRevoked);
+        assert_eq!(client.get_document_status(&hash2), DocumentStatus::Active);
+    }
+
+    #[test]
+    fn batch_revoke_rejects_empty() {
+        let (env, client, issuer, _, _) = setup();
+
+        let hash_vec: soroban_sdk::Vec<BytesN<32>> = soroban_sdk::vec![&env];
+        let err = client
+            .try_batch_revoke_documents(&issuer, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::BatchEmpty);
+    }
+
+    #[test]
+    fn batch_revoke_rejects_oversized() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let mut hash_vec: soroban_sdk::Vec<BytesN<32>> = soroban_sdk::vec![&env];
+        for i in 0..21u8 {
+            let h = BytesN::from_array(&env, &[i; 32]);
+            client.register_document(&issuer, &owner, &h);
+            hash_vec.push_back(h);
+        }
+
+        let err = client
+            .try_batch_revoke_documents(&issuer, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::BatchTooLarge);
+    }
+
+    // --- initialize / get_version / get_admin ---
+
+    #[test]
+    fn initialize_sets_admin_and_version() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        assert_eq!(client.get_version(), 1);
+        assert_eq!(client.get_admin(), Some(admin));
+    }
+
+    #[test]
+    fn get_version_returns_zero_before_init() {
+        let (_env, client, _, _, _) = setup();
+        assert_eq!(client.get_version(), 0);
+    }
+
+    #[test]
+    fn get_admin_returns_none_before_init() {
+        let (_env, client, _, _, _) = setup();
+        assert_eq!(client.get_admin(), None);
+    }
+
+    #[test]
+    fn double_initialize_fails() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        let err = client.try_initialize(&admin).unwrap_err().unwrap();
+        assert_eq!(err, ContractError::AlreadyInitialized);
+    }
+
+    // --- upgrade ---
+
+    #[test]
+    fn upgrade_requires_initialization() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+        let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        let err = client
+            .try_upgrade(&admin, &wasm_hash)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::NotInitialized);
+    }
+
+    #[test]
+    fn non_admin_cannot_upgrade() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+        let other = Address::generate(&env);
+        let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        client.initialize(&admin);
+
+        let err = client
+            .try_upgrade(&other, &wasm_hash)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::Unauthorized);
+    }
+
+    // --- migrate ---
+
+    #[test]
+    fn migrate_v0_to_v1_sets_versioning() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+
+        // Simulate pre-versioned state: no initialize called, DataKey::Version absent.
+        let new_version = client.migrate(&admin);
+
+        assert_eq!(new_version, 1);
+        assert_eq!(client.get_version(), 1);
+        assert_eq!(client.get_admin(), Some(admin));
+    }
+
+    #[test]
+    fn migrate_already_current_fails() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        let err = client.try_migrate(&admin).unwrap_err().unwrap();
+        assert_eq!(err, ContractError::MigrationNotNeeded);
+    }
+
+    #[test]
+    fn documents_still_work_after_migration() {
+        let (env, client, issuer, owner, document_hash) = setup();
+        let admin = Address::generate(&env);
+
+        // Register a document before any versioning is set up.
+        client.register_document(&issuer, &owner, &document_hash);
+
+        // Migrate from v0 to v1.
+        client.migrate(&admin);
+
+        // Document still verifiable after migration.
+        assert!(client.verify_document(&document_hash));
+        assert_eq!(client.get_document_status(&document_hash), DocumentStatus::Active);
+    }
+
+    // --- feature flags ---
+
+    #[test]
+    fn get_feature_flag_returns_false_for_unset() {
+        let (env, client, _, _, _) = setup();
+        let flag = Symbol::new(&env, "batch_ops");
+        assert!(!client.get_feature_flag(&flag));
+    }
+
+    #[test]
+    fn admin_can_set_and_get_feature_flag() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+        let flag = Symbol::new(&env, "batch_ops");
+
+        client.initialize(&admin);
+        client.set_feature_flag(&admin, &flag, &true);
+
+        assert!(client.get_feature_flag(&flag));
+    }
+
+    #[test]
+    fn non_admin_cannot_set_feature_flag() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+        let other = Address::generate(&env);
+        let flag = Symbol::new(&env, "batch_ops");
+
+        client.initialize(&admin);
+
+        let err = client
+            .try_set_feature_flag(&other, &flag, &true)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::Unauthorized);
+    }
+
+    #[test]
+    fn set_feature_flag_requires_initialization() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+        let flag = Symbol::new(&env, "batch_ops");
+
+        let err = client
+            .try_set_feature_flag(&admin, &flag, &true)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::NotInitialized);
+    }
+}
 
     /// Initializes the contract for a new deployment, setting the admin and contract version.
     ///
@@ -793,7 +1414,6 @@ impl ProofStellContract {
             .get::<DataKey, bool>(&DataKey::FeatureFlag(flag))
             .unwrap_or(false)
     }
-}
 
 #[cfg(test)]
 mod tests {
@@ -958,7 +1578,7 @@ mod tests {
         assert!(client.document_exists(&document_hash));
     }
 
-<<<<<<< HEAD
+
     // ── Rate limiting tests ──────────────────────────────────────────────
 
     #[test]
@@ -1055,8 +1675,7 @@ mod tests {
         let result = client.try_register_document(&issuer, &owner2, &hash);
         assert!(result.is_ok());
     }
-}
-=======
+
     // --- batch_register_documents ---
 
     #[test]
@@ -1411,4 +2030,3 @@ mod tests {
         assert_eq!(err, ContractError::NotInitialized);
     }
 }
->>>>>>> e0fc42a42093127d66bf07a090c78c21587a3874
