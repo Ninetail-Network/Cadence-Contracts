@@ -105,6 +105,39 @@ Horizon proof exists).
 
 ---
 
+## 🔑 Canonical Hash Encoding
+
+ProofStell uses **SHA-256** as the only supported hash algorithm. All public APIs enforce this at the service boundary.
+
+| Property | Value |
+|---|---|
+| Algorithm | SHA-256 |
+| Encoding | Lowercase hexadecimal |
+| Length | 64 characters (32 bytes) |
+
+**Valid example:**
+```
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+```
+
+**Invalid examples:**
+```
+# Too short (SHA-1):
+da39a3ee5e6b4b0d3255bfef95601890afd80709
+
+# SHA-512 (128 chars) — rejected before contract submission:
+cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e
+
+# Uppercase — normalize before submission:
+E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855
+```
+
+Use `HashValidator::validate_for_contract(hash)` to normalize and validate before calling the contract. Use `HashValidator::hex_to_bytes32(hex)` to convert the normalized hex string to the `[u8; 32]` array required by the Soroban `BytesN<32>` type.
+
+Cache keys and Stellar Horizon memo queries always use the lowercase-normalized form so that clients submitting mixed-case hashes receive consistent results.
+
+---
+
 ## 🗂️ Data Model
 
 

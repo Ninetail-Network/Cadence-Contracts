@@ -95,7 +95,7 @@ impl StellarClient {
     }
 
     pub fn verification_cache_key(hash: &str) -> CacheKey {
-        CacheKey::Verification(hash.to_string())
+        CacheKey::verification(hash)
     }
 
     pub async fn check_connection(&self) -> bool {
@@ -297,6 +297,12 @@ mod tests {
     #[test]
     fn verification_cache_key_is_consistent() {
         let key = StellarClient::verification_cache_key("abc123");
+        assert_eq!(key.as_string(), "verification:abc123");
+    }
+
+    #[test]
+    fn verification_cache_key_normalizes_uppercase() {
+        let key = StellarClient::verification_cache_key("ABC123");
         assert_eq!(key.as_string(), "verification:abc123");
     }
 
