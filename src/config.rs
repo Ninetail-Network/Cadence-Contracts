@@ -14,8 +14,29 @@ pub struct AppConfig {
     pub stellar_horizon_url: String,
     pub stellar_secret_key: Option<String>,
     pub redis_url: String,
+
+    // ── Global rate-limit tier ──────────────────────────────────────────
+    /// Maximum requests per second across **all** issuers combined.
     pub rate_limit_per_second: u32,
+    /// Burst allowance for the global tier.
     pub rate_limit_burst: u32,
+
+    // ── Per-issuer rate-limit tier ──────────────────────────────────────
+    /// Maximum requests per second **per issuer** address.
+    ///
+    /// Defaults to `10`. The global tier always takes precedence; this limit
+    /// applies after the global bucket has been checked.
+    pub per_issuer_rate_limit_per_second: u32,
+    /// Burst allowance for the per-issuer tier.
+    ///
+    /// Defaults to twice `per_issuer_rate_limit_per_second`.
+    pub per_issuer_rate_limit_burst: u32,
+    /// Seconds an issuer entry is kept alive after its last request.
+    ///
+    /// Entries older than this TTL are eligible for eviction by the background
+    /// cleanup task. Defaults to `3600` (1 hour).
+    pub issuer_rate_limit_ttl_seconds: u64,
+
     pub stellar_max_retries: u32,
     pub log_level: String,
     pub webhook_urls: Vec<String>,
@@ -35,6 +56,9 @@ impl fmt::Debug for AppConfig {
             .field("redis_url", &self.redis_url)
             .field("rate_limit_per_second", &self.rate_limit_per_second)
             .field("rate_limit_burst", &self.rate_limit_burst)
+            .field("per_issuer_rate_limit_per_second", &self.per_issuer_rate_limit_per_second)
+            .field("per_issuer_rate_limit_burst", &self.per_issuer_rate_limit_burst)
+            .field("issuer_rate_limit_ttl_seconds", &self.issuer_rate_limit_ttl_seconds)
             .field("stellar_max_retries", &self.stellar_max_retries)
             .field("log_level", &self.log_level)
             .field("webhook_urls", &self.webhook_urls)
@@ -100,10 +124,24 @@ impl AppConfig {
         };
         let webhook_secret = env::var("WEBHOOK_SECRET").ok();
 
-        // Numeric values with defaults
-        let rate_limit_per_second_raw = get_env_or_default("RATE_LIMIT_PER_SECOND", "10");
+        // ── Global rate-limit raw values ─────────────────────────────────
+        let rate_limit_per_second_raw = get_env_or_default("RATE_LIMIT_PER_SECOND", "100");
         let rate_limit_burst_raw =
             get_env_or_default("RATE_LIMIT_BURST", &rate_limit_per_second_raw);
+
+        // ── Per-issuer rate-limit raw values ─────────────────────────────
+        let per_issuer_rps_raw = get_env_or_default("PER_ISSUER_RATE_LIMIT_PER_SECOND", "10");
+        let per_issuer_burst_default = format!(
+            "{}",
+            per_issuer_rps_raw
+                .parse::<u32>()
+                .unwrap_or(10)
+                .saturating_mul(2)
+        );
+        let per_issuer_burst_raw =
+            get_env_or_default("PER_ISSUER_RATE_LIMIT_BURST", &per_issuer_burst_default);
+        let issuer_ttl_raw = get_env_or_default("ISSUER_RATE_LIMIT_TTL_SECONDS", "3600");
+
         let stellar_max_retries_raw = get_env_or_default("STELLAR_MAX_RETRIES", "3");
         let cache_verification_ttl_raw = get_env_or_default("CACHE_VERIFICATION_TTL", "3600");
 
@@ -128,19 +166,19 @@ impl AppConfig {
             ));
         }
 
-        // Parse numeric values
+        // ── Parse global rate-limit values ───────────────────────────────
         let rate_limit_per_second: u32 = match rate_limit_per_second_raw.parse() {
             Ok(v) if v > 0 => v,
             Ok(_) => {
                 errors.push("RATE_LIMIT_PER_SECOND must be greater than 0".to_string());
-                10
+                100
             }
             Err(_) => {
                 errors.push(format!(
                     "RATE_LIMIT_PER_SECOND must be a valid u32, got '{}'",
                     rate_limit_per_second_raw
                 ));
-                10
+                100
             }
         };
 
@@ -155,6 +193,70 @@ impl AppConfig {
             }
         };
 
+        if rate_limit_burst == 0 {
+            errors.push("RATE_LIMIT_BURST must be greater than 0".to_string());
+        }
+
+        // ── Parse per-issuer rate-limit values ───────────────────────────
+        let per_issuer_rate_limit_per_second: u32 = match per_issuer_rps_raw.parse() {
+            Ok(v) if v > 0 => v,
+            Ok(_) => {
+                errors.push(
+                    "PER_ISSUER_RATE_LIMIT_PER_SECOND must be greater than 0".to_string(),
+                );
+                10
+            }
+            Err(_) => {
+                errors.push(format!(
+                    "PER_ISSUER_RATE_LIMIT_PER_SECOND must be a valid u32, got '{}'",
+                    per_issuer_rps_raw
+                ));
+                10
+            }
+        };
+
+        let per_issuer_rate_limit_burst: u32 = match per_issuer_burst_raw.parse() {
+            Ok(v) if v > 0 => v,
+            Ok(_) => {
+                errors.push(
+                    "PER_ISSUER_RATE_LIMIT_BURST must be greater than 0".to_string(),
+                );
+                per_issuer_rate_limit_per_second * 2
+            }
+            Err(_) => {
+                errors.push(format!(
+                    "PER_ISSUER_RATE_LIMIT_BURST must be a valid u32, got '{}'",
+                    per_issuer_burst_raw
+                ));
+                per_issuer_rate_limit_per_second * 2
+            }
+        };
+
+        if per_issuer_rate_limit_per_second > rate_limit_per_second {
+            errors.push(format!(
+                "PER_ISSUER_RATE_LIMIT_PER_SECOND ({}) must not exceed RATE_LIMIT_PER_SECOND ({})",
+                per_issuer_rate_limit_per_second, rate_limit_per_second
+            ));
+        }
+
+        let issuer_rate_limit_ttl_seconds: u64 = match issuer_ttl_raw.parse() {
+            Ok(v) if v > 0 => v,
+            Ok(_) => {
+                errors.push(
+                    "ISSUER_RATE_LIMIT_TTL_SECONDS must be greater than 0".to_string(),
+                );
+                3600
+            }
+            Err(_) => {
+                errors.push(format!(
+                    "ISSUER_RATE_LIMIT_TTL_SECONDS must be a valid u64, got '{}'",
+                    issuer_ttl_raw
+                ));
+                3600
+            }
+        };
+
+        // ── Parse remaining values ────────────────────────────────────────
         let stellar_max_retries: u32 = match stellar_max_retries_raw.parse() {
             Ok(v) => v,
             Err(_) => {
@@ -185,10 +287,6 @@ impl AppConfig {
                     redis_url
                 ));
             }
-        }
-
-        if rate_limit_burst == 0 {
-            errors.push("RATE_LIMIT_BURST must be greater than 0".to_string());
         }
 
         let webhook_urls: Vec<String> = webhook_urls_raw
@@ -223,6 +321,9 @@ impl AppConfig {
             redis_url,
             rate_limit_per_second,
             rate_limit_burst,
+            per_issuer_rate_limit_per_second,
+            per_issuer_rate_limit_burst,
+            issuer_rate_limit_ttl_seconds,
             stellar_max_retries,
             log_level,
             webhook_urls,
@@ -247,6 +348,9 @@ mod tests {
             "REDIS_URL",
             "RATE_LIMIT_PER_SECOND",
             "RATE_LIMIT_BURST",
+            "PER_ISSUER_RATE_LIMIT_PER_SECOND",
+            "PER_ISSUER_RATE_LIMIT_BURST",
+            "ISSUER_RATE_LIMIT_TTL_SECONDS",
             "STELLAR_MAX_RETRIES",
             "LOG_LEVEL",
             "WEBHOOK_URLS",
@@ -258,24 +362,51 @@ mod tests {
         }
     }
 
+    const VALID_KEY: &str = "SBU2RRGLXH3E5CQHTD3ODLDF2BWDCYUSSBLLZ5GNW7JXHDIYKXZWHOKR";
+
     #[test]
     fn from_env_uses_defaults_when_missing() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        env::set_var(
-            "STELLAR_SECRET_KEY",
-            "SBU2RRGLXH3E5CQHTD3ODLDF2BWDCYUSSBLLZ5GNW7JXHDIYKXZWHOKR",
-        );
+        env::set_var("STELLAR_SECRET_KEY", VALID_KEY);
         let cfg = AppConfig::from_env().expect("config should load with defaults");
 
         assert_eq!(cfg.port, 8080);
-        assert_eq!(
-            cfg.stellar_horizon_url,
-            "https://horizon-testnet.stellar.org"
-        );
+        assert_eq!(cfg.stellar_horizon_url, "https://horizon-testnet.stellar.org");
         assert_eq!(cfg.redis_url, "redis://127.0.0.1:6379");
-        assert_eq!(cfg.rate_limit_per_second, 10);
+        assert_eq!(cfg.rate_limit_per_second, 100);
+        assert_eq!(cfg.per_issuer_rate_limit_per_second, 10);
+        assert_eq!(cfg.per_issuer_rate_limit_burst, 20);
+        assert_eq!(cfg.issuer_rate_limit_ttl_seconds, 3600);
         assert_eq!(cfg.cache_verification_ttl, 3600);
+    }
+
+    #[test]
+    fn from_env_parses_per_issuer_rate_limit_fields() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        env::set_var("STELLAR_SECRET_KEY", VALID_KEY);
+        env::set_var("RATE_LIMIT_PER_SECOND", "500");
+        env::set_var("PER_ISSUER_RATE_LIMIT_PER_SECOND", "50");
+        env::set_var("PER_ISSUER_RATE_LIMIT_BURST", "100");
+        env::set_var("ISSUER_RATE_LIMIT_TTL_SECONDS", "7200");
+
+        let cfg = AppConfig::from_env().expect("should parse");
+        assert_eq!(cfg.per_issuer_rate_limit_per_second, 50);
+        assert_eq!(cfg.per_issuer_rate_limit_burst, 100);
+        assert_eq!(cfg.issuer_rate_limit_ttl_seconds, 7200);
+    }
+
+    #[test]
+    fn from_env_rejects_per_issuer_rps_greater_than_global() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        env::set_var("STELLAR_SECRET_KEY", VALID_KEY);
+        env::set_var("RATE_LIMIT_PER_SECOND", "10");
+        env::set_var("PER_ISSUER_RATE_LIMIT_PER_SECOND", "100"); // exceeds global
+
+        let err = AppConfig::from_env().expect_err("should fail");
+        assert!(err.to_string().contains("PER_ISSUER_RATE_LIMIT_PER_SECOND"));
     }
 
     #[test]
@@ -288,10 +419,7 @@ mod tests {
         env::set_var("RATE_LIMIT_PER_SECOND", "0");
         env::set_var("RATE_LIMIT_BURST", "0");
         env::set_var("WEBHOOK_URLS", "https://ok.example.com, not-a-url");
-        env::set_var(
-            "STELLAR_SECRET_KEY",
-            "SBU2RRGLXH3E5CQHTD3ODLDF2BWDCYUSSBLLZ5GNW7JXHDIYKXZWHOKR",
-        );
+        env::set_var("STELLAR_SECRET_KEY", VALID_KEY);
 
         let err = AppConfig::from_env().expect_err("config should fail");
         let msg = err.to_string();
@@ -314,9 +442,9 @@ mod tests {
         );
 
         let err = AppConfig::from_env().expect_err("config should fail");
-        let msg = err.to_string();
-
-        assert!(msg.contains("STELLAR_SECRET_KEY must be a valid Stellar ed25519 secret key"));
+        assert!(err
+            .to_string()
+            .contains("STELLAR_SECRET_KEY must be a valid Stellar ed25519 secret key"));
     }
 
     #[test]
@@ -329,10 +457,7 @@ mod tests {
         env::set_var("RATE_LIMIT_PER_SECOND", "100");
         env::set_var("RATE_LIMIT_BURST", "100");
         env::set_var("WEBHOOK_URLS", "https://a.com, https://b.com");
-        env::set_var(
-            "STELLAR_SECRET_KEY",
-            "SBU2RRGLXH3E5CQHTD3ODLDF2BWDCYUSSBLLZ5GNW7JXHDIYKXZWHOKR",
-        );
+        env::set_var("STELLAR_SECRET_KEY", VALID_KEY);
 
         let cfg = AppConfig::from_env().expect("config should load");
 
@@ -353,6 +478,9 @@ mod tests {
             redis_url: "redis://redis:6379".to_string(),
             rate_limit_per_second: 10,
             rate_limit_burst: 10,
+            per_issuer_rate_limit_per_second: 2,
+            per_issuer_rate_limit_burst: 4,
+            issuer_rate_limit_ttl_seconds: 3600,
             stellar_max_retries: 3,
             log_level: "info".to_string(),
             webhook_urls: vec!["https://webhook.example.com".to_string()],
@@ -371,13 +499,11 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         env::set_var("PORT", "0");
-        env::set_var(
-            "STELLAR_SECRET_KEY",
-            "SBU2RRGLXH3E5CQHTD3ODLDF2BWDCYUSSBLLZ5GNW7JXHDIYKXZWHOKR",
-        );
+        env::set_var("STELLAR_SECRET_KEY", VALID_KEY);
 
         let metrics = MetricsRegistry::arc();
-        let _err = AppConfig::from_env_with_metrics(Some(Arc::clone(&metrics))).expect_err("should fail");
+        let _err =
+            AppConfig::from_env_with_metrics(Some(Arc::clone(&metrics))).expect_err("should fail");
 
         let output = metrics.render();
         assert!(output.contains("config_validation_failures_total"));
@@ -387,13 +513,11 @@ mod tests {
     fn from_env_records_config_reload_on_success() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        env::set_var(
-            "STELLAR_SECRET_KEY",
-            "SBU2RRGLXH3E5CQHTD3ODLDF2BWDCYUSSBLLZ5GNW7JXHDIYKXZWHOKR",
-        );
+        env::set_var("STELLAR_SECRET_KEY", VALID_KEY);
 
         let metrics = MetricsRegistry::arc();
-        let _cfg = AppConfig::from_env_with_metrics(Some(Arc::clone(&metrics))).expect("should succeed");
+        let _cfg = AppConfig::from_env_with_metrics(Some(Arc::clone(&metrics)))
+            .expect("should succeed");
 
         let output = metrics.render();
         assert!(output.contains("config_reload_total"));

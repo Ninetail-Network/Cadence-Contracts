@@ -33,9 +33,16 @@ pub struct MetricsRegistry {
     horizon_latency_seconds: HistogramVec,
     retry_total: IntCounter,
 
-    // ── Rate limiter metrics ──
+    // ── Rate limiter metrics (legacy global) ──
     rate_limit_tokens_consumed: IntCounter,
     rate_limit_violations: IntCounter,
+
+    // ── Rate limiter metrics (per-issuer, two-tier) ──
+    /// Counts every request that passed both rate-limit tiers, labelled by issuer.
+    rate_limit_hits: IntCounterVec,
+    /// Counts every request rejected by either tier, labelled by issuer and tier
+    /// (`"global"` or `"issuer"`).
+    rate_limit_rejections: IntCounterVec,
 
     // ── Event ingestion metrics ──
     event_duplicates: IntCounter,
@@ -125,16 +132,38 @@ impl MetricsRegistry {
             IntCounter::new("retry_total", "Total number of retry attempts across all operations")
                 .unwrap();
 
-        // ── Rate limiter metrics ──
+        // ── Rate limiter metrics (legacy) ──
         let rate_limit_tokens_consumed = IntCounter::new(
             "rate_limit_tokens_consumed_total",
-            "Total rate limiter tokens consumed",
+            "Total rate limiter tokens consumed (legacy global limiter)",
         )
         .unwrap();
 
         let rate_limit_violations = IntCounter::new(
             "rate_limit_violations_total",
-            "Total rate limit violations (requests rejected)",
+            "Total rate limit violations – legacy global limiter (requests rejected)",
+        )
+        .unwrap();
+
+        // ── Rate limiter metrics (per-issuer, two-tier) ──
+        //
+        // `rate_limit_hits_total{issuer="<addr>"}` — accepted requests per issuer.
+        // `rate_limit_rejections_total{issuer="<addr>",tier="global"|"issuer"}` — rejections.
+        let rate_limit_hits = IntCounterVec::new(
+            Opts::new(
+                "rate_limit_hits_total",
+                "Total requests that passed rate limiting, labelled by issuer",
+            ),
+            &["issuer"],
+        )
+        .unwrap();
+
+        let rate_limit_rejections = IntCounterVec::new(
+            Opts::new(
+                "rate_limit_rejections_total",
+                "Total requests rejected by rate limiting, labelled by issuer and tier",
+            ),
+            &["issuer", "tier"],
         )
         .unwrap();
 
@@ -170,64 +199,32 @@ impl MetricsRegistry {
         )
         .unwrap();
 
-        // Register everything
-        registry
-            .register(Box::new(request_count.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(error_count.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(cache_hits.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(cache_misses.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(cache_expired.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(cache_serialization_failures.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(document_registration_total.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(document_revocation_total.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(verification_total.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(verification_latency_seconds.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(horizon_latency_seconds.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(retry_total.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(rate_limit_tokens_consumed.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(rate_limit_violations.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(event_duplicates.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(event_ordering_failures.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(event_backlog_size.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(config_validation_failures.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(config_reload_total.clone()))
-            .unwrap();
+        // ── Register everything ───────────────────────────────────────────
+        for metric in [
+            Box::new(request_count.clone()) as Box<dyn prometheus::core::Collector>,
+            Box::new(error_count.clone()),
+            Box::new(cache_hits.clone()),
+            Box::new(cache_misses.clone()),
+            Box::new(cache_expired.clone()),
+            Box::new(cache_serialization_failures.clone()),
+            Box::new(document_registration_total.clone()),
+            Box::new(document_revocation_total.clone()),
+            Box::new(verification_total.clone()),
+            Box::new(verification_latency_seconds.clone()),
+            Box::new(horizon_latency_seconds.clone()),
+            Box::new(retry_total.clone()),
+            Box::new(rate_limit_tokens_consumed.clone()),
+            Box::new(rate_limit_violations.clone()),
+            Box::new(rate_limit_hits.clone()),
+            Box::new(rate_limit_rejections.clone()),
+            Box::new(event_duplicates.clone()),
+            Box::new(event_ordering_failures.clone()),
+            Box::new(event_backlog_size.clone()),
+            Box::new(config_validation_failures.clone()),
+            Box::new(config_reload_total.clone()),
+        ] {
+            registry.register(metric).unwrap();
+        }
 
         Self {
             registry,
@@ -245,6 +242,8 @@ impl MetricsRegistry {
             retry_total,
             rate_limit_tokens_consumed,
             rate_limit_violations,
+            rate_limit_hits,
+            rate_limit_rejections,
             event_duplicates,
             event_ordering_failures,
             event_backlog_size,
@@ -319,7 +318,7 @@ impl MetricsRegistry {
         self.retry_total.inc();
     }
 
-    // ── Rate limiter metrics ─────────────────────────────────────────────
+    // ── Rate limiter metrics (legacy) ────────────────────────────────────
 
     pub fn record_token_consumed(&self) {
         self.rate_limit_tokens_consumed.inc();
@@ -327,6 +326,29 @@ impl MetricsRegistry {
 
     pub fn increment_rate_limit_violation(&self) {
         self.rate_limit_violations.inc();
+    }
+
+    // ── Rate limiter metrics (per-issuer, two-tier) ──────────────────────
+
+    /// Record an accepted request for `issuer`.
+    pub fn increment_rate_limit_hit(&self, issuer: &str) {
+        self.rate_limit_hits
+            .with_label_values(&[issuer])
+            .inc();
+    }
+
+    /// Record a rejection originating from the **global** tier.
+    pub fn increment_rate_limit_global_rejection(&self, issuer: &str) {
+        self.rate_limit_rejections
+            .with_label_values(&[issuer, "global"])
+            .inc();
+    }
+
+    /// Record a rejection originating from the **per-issuer** tier.
+    pub fn increment_rate_limit_issuer_rejection(&self, issuer: &str) {
+        self.rate_limit_rejections
+            .with_label_values(&[issuer, "issuer"])
+            .inc();
     }
 
     // ── Event ingestion metrics ──────────────────────────────────────────
@@ -415,6 +437,9 @@ mod tests {
         metrics.increment_retry();
         metrics.record_token_consumed();
         metrics.increment_rate_limit_violation();
+        metrics.increment_rate_limit_hit("GDEX...");
+        metrics.increment_rate_limit_global_rejection("GDEX...");
+        metrics.increment_rate_limit_issuer_rejection("GDEX...");
         metrics.increment_event_duplicate();
         metrics.increment_event_ordering_failure();
         metrics.set_event_backlog(5);
@@ -424,14 +449,34 @@ mod tests {
         metrics.increment_config_reload();
 
         let output = metrics.render();
-        // Verify key metric names appear in the rendered output
         assert!(output.contains("requests_total"));
         assert!(output.contains("cache_hits_total"));
         assert!(output.contains("verification_total"));
         assert!(output.contains("horizon_latency_seconds"));
         assert!(output.contains("rate_limit_violations_total"));
+        assert!(output.contains("rate_limit_hits_total"));
+        assert!(output.contains("rate_limit_rejections_total"));
         assert!(output.contains("event_backlog_size"));
         assert!(output.contains("config_validation_failures_total"));
+    }
+
+    #[test]
+    fn per_issuer_hit_metric_carries_issuer_label() {
+        let metrics = MetricsRegistry::new();
+        metrics.increment_rate_limit_hit("GDEXISSUER001");
+        let output = metrics.render();
+        assert!(output.contains("GDEXISSUER001"));
+        assert!(output.contains("rate_limit_hits_total"));
+    }
+
+    #[test]
+    fn rejection_metric_carries_tier_label() {
+        let metrics = MetricsRegistry::new();
+        metrics.increment_rate_limit_global_rejection("GDEXISSUER001");
+        metrics.increment_rate_limit_issuer_rejection("GDEXISSUER001");
+        let output = metrics.render();
+        assert!(output.contains(r#"tier="global""#));
+        assert!(output.contains(r#"tier="issuer""#));
     }
 
     #[test]
