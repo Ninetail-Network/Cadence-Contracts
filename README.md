@@ -66,6 +66,28 @@ Horizon proof exists).
 
 ---
 
+### 🔄 Upgrades & Governance
+
+* Single-admin governance — one address (set at `initialize`) controls upgrades, migrations, and feature flags
+* Contract version stored in persistent ledger — survives ledger entry expiry
+* Feature flags allow toggling behaviours without a full WASM upgrade
+* `ContractInitialized` and `ContractUpgraded` events let indexers detect which contract version produced any given document event
+
+---
+
+### 📦 Batch Operations
+
+* `batch_register_documents` — register up to 20 documents in one transaction
+* `batch_revoke_documents` — revoke up to 20 documents in one transaction
+
+**Atomicity:** All documents succeed or none are written. If any item in the batch fails (e.g. duplicate hash, wrong issuer, already revoked), the entire call returns an error and no state is changed.
+
+**Batch size limit:** Maximum 20 documents per call. Exceeding this returns `BatchTooLarge` (error code 7). Empty batches return `BatchEmpty` (error code 8).
+
+**Fee implications:** A single transaction covers the entire batch regardless of size, making bulk operations significantly cheaper than individual calls. For best results, pre-validate document uniqueness and existence client-side before submitting to avoid wasted transaction fees on partial failures.
+
+---
+
 ## 🧠 How It Works
 
 1. Document is hashed (SHA256)
@@ -80,6 +102,39 @@ Horizon proof exists).
    * Status
 
 4. Verification compares hash with stored record
+
+---
+
+## 🔑 Canonical Hash Encoding
+
+ProofStell uses **SHA-256** as the only supported hash algorithm. All public APIs enforce this at the service boundary.
+
+| Property | Value |
+|---|---|
+| Algorithm | SHA-256 |
+| Encoding | Lowercase hexadecimal |
+| Length | 64 characters (32 bytes) |
+
+**Valid example:**
+```
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+```
+
+**Invalid examples:**
+```
+# Too short (SHA-1):
+da39a3ee5e6b4b0d3255bfef95601890afd80709
+
+# SHA-512 (128 chars) — rejected before contract submission:
+cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e
+
+# Uppercase — normalize before submission:
+E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855
+```
+
+Use `HashValidator::validate_for_contract(hash)` to normalize and validate before calling the contract. Use `HashValidator::hex_to_bytes32(hex)` to convert the normalized hex string to the `[u8; 32]` array required by the Soroban `BytesN<32>` type.
+
+Cache keys and Stellar Horizon memo queries always use the lowercase-normalized form so that clients submitting mixed-case hashes receive consistent results.
 
 ---
 
@@ -139,6 +194,68 @@ soroban contract deploy \
 --wasm target/wasm32-unknown-unknown/release/proofstell_contract.wasm \
 --network testnet
 ```
+
+---
+
+### Initialize After Deployment
+
+After deploying, call `initialize` to set the admin address and record version 1 on-chain:
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <ADMIN_SECRET_KEY> \
+  --network testnet \
+  -- initialize \
+  --admin <ADMIN_ADDRESS>
+```
+
+---
+
+### Upgrade Procedure
+
+1. **Build the new WASM** and upload it to the ledger:
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+soroban contract install \
+  --wasm target/wasm32-unknown-unknown/release/proofstell_contract.wasm \
+  --network testnet
+# Note the returned WASM hash
+```
+
+2. **Call `upgrade`** with the new WASM hash:
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <ADMIN_SECRET_KEY> \
+  --network testnet \
+  -- upgrade \
+  --admin <ADMIN_ADDRESS> \
+  --new_wasm_hash <WASM_HASH>
+```
+
+3. **Call `migrate`** to apply any data transformations and bump the version:
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <ADMIN_SECRET_KEY> \
+  --network testnet \
+  -- migrate \
+  --admin <ADMIN_ADDRESS>
+```
+
+### Rollback Plan
+
+Soroban contract upgrades are irreversible on-chain — there is no undo. To roll back:
+
+1. Keep the previous WASM hash recorded before upgrading.
+2. If the new version is broken, call `upgrade` again with the old WASM hash.
+3. If the migration mutated storage in an incompatible way, a compensating migration must be written into the rolled-back WASM.
+
+**Recommendation:** always test upgrades on testnet before applying to mainnet. See [docs/UPGRADE_GOVERNANCE.md](docs/UPGRADE_GOVERNANCE.md) for the full decision process.
 
 ---
 

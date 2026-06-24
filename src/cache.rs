@@ -23,6 +23,11 @@ pub enum CacheKey {
 }
 
 impl CacheKey {
+    /// Construct a `Verification` key with a normalized (lowercase, trimmed) hash.
+    pub fn verification(hash: &str) -> Self {
+        CacheKey::Verification(hash.trim().to_lowercase())
+    }
+
     pub fn as_string(&self) -> String {
         match self {
             CacheKey::Verification(hash) => format!("verification:{}", hash),
@@ -321,6 +326,13 @@ mod tests {
         let v_key = CacheKey::Verification("x".to_string());
         let c_key = CacheKey::Config("x".to_string());
         assert_ne!(v_key.as_string(), c_key.as_string());
+    }
+
+    #[tokio::test]
+    async fn verification_key_normalizes_case() {
+        let lower = CacheKey::verification("abc");
+        let upper = CacheKey::verification("ABC");
+        assert_eq!(lower.as_string(), upper.as_string());
     }
 
     #[tokio::test]
