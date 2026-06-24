@@ -42,9 +42,24 @@ pub struct DocumentRecord {
     pub status: DocumentStatus,
 }
 
+/// Rate limit state for token bucket algorithm.
+/// Tracks available tokens and last refill time for quota enforcement.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitState {
+    /// Current tokens available (0 to max_burst)
+    pub tokens: u64,
+    /// Last refill timestamp (Unix seconds)
+    pub last_refill_secs: u64,
+}
+
 #[contracttype]
 pub enum DataKey {
     Document(BytesN<32>),
+    /// Per-issuer rate limit state
+    IssuerRateLimit(Address),
+    /// Per-address (owner) rate limit state
+    AddressRateLimit(Address),
     Admin,
     Version,
     FeatureFlag(Symbol),
@@ -75,12 +90,7 @@ pub const MAX_BATCH_SIZE: u32 = 20;
 /// | `AlreadyRevoked`       | 4    | The document has already been revoked                    |
 /// | `InvalidOwner`         | 5    | The provided owner address is not valid for this op      |
 /// | `InvalidIssuer`        | 6    | The provided issuer address is not valid for this op     |
-/// | `BatchTooLarge`        | 7    | Batch exceeds the 20-document limit                      |
-/// | `BatchEmpty`           | 8    | Batch input is empty                                     |
-/// | `AlreadyInitialized`   | 9    | `initialize` called when contract is already initialized |
-/// | `NotInitialized`       | 10   | Governance call before `initialize`                      |
-/// | `Unauthorized`         | 11   | Caller is not the stored admin                           |
-/// | `MigrationNotNeeded`   | 12   | Contract is already at the latest version                |
+
 #[contracterror]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContractError {
@@ -96,18 +106,20 @@ pub enum ContractError {
     InvalidOwner = 5,
     /// The provided issuer address failed validation. Code: 6
     InvalidIssuer = 6,
-    /// The batch exceeds the maximum allowed size (20). Code: 7
-    BatchTooLarge = 7,
-    /// The batch is empty. Code: 8
-    BatchEmpty = 8,
-    /// The contract has already been initialized. Code: 9
-    AlreadyInitialized = 9,
-    /// The contract has not been initialized yet. Code: 10
-    NotInitialized = 10,
-    /// The caller is not the authorized admin. Code: 11
-    Unauthorized = 11,
-    /// The contract is already at the latest version; no migration is needed. Code: 12
-    MigrationNotNeeded = 12,
+    /// Rate limit exceeded; caller should retry after delay. Code: 7
+    RateLimitExceeded = 7,
+    /// The batch exceeds the maximum allowed size (20). Code: 8
+    BatchTooLarge = 8,
+    /// The batch is empty. Code: 9
+    BatchEmpty = 9,
+    /// The contract has already been initialized. Code: 10
+    AlreadyInitialized = 10,
+    /// The contract has not been initialized yet. Code: 11
+    NotInitialized = 11,
+    /// The caller is not the authorized admin. Code: 12
+    Unauthorized = 12,
+    /// The contract is already at the latest version; no migration is needed. Code: 13
+    MigrationNotNeeded = 13,
 }
 
 #[contractevent(topics = ["register"], data_format = "vec")]
@@ -143,11 +155,134 @@ pub struct ContractUpgraded {
 #[contract]
 pub struct ProofStellContract;
 
+// ── Contract-level rate limit constants ──
+// These define the token bucket parameters for rate limiting.
+// On-chain contracts cannot read environment variables, so these are fixed.
+// Adjust via contract redeployment if needed. Default values are tuned for
+// typical usage; high-volume issuers may need custom configuration.
+
+/// Per-issuer rate limit: tokens per second
+const ISSUER_RATE_LIMIT_PER_SECOND: u64 = 100;
+/// Per-issuer rate limit: burst allowance (max tokens in bucket)
+const ISSUER_RATE_LIMIT_BURST: u64 = 100;
+/// Per-address rate limit: tokens per second
+const ADDRESS_RATE_LIMIT_PER_SECOND: u64 = 50;
+/// Per-address rate limit: burst allowance (max tokens in bucket)
+const ADDRESS_RATE_LIMIT_BURST: u64 = 100;
+/// Token cost for a single operation (register, revoke, etc.)
+const OPERATION_COST: u64 = 1;
+
 #[contractimpl]
 impl ProofStellContract {
+    /// Check and consume tokens from the issuer's rate limit bucket.
+    ///
+    /// Uses a token bucket algorithm: refills at `refill_rate` tokens per second
+    /// (up to `max_burst`), and consumes `cost` tokens per operation.
+    ///
+    /// # Arguments
+    /// * `env`        - The Soroban environment
+    /// * `issuer`     - Address of the issuer to rate-limit
+    /// * `cost`       - Tokens to consume for this operation
+    /// * `refill_rate` - Tokens added per second
+    /// * `max_burst`  - Maximum bucket capacity
+    ///
+    /// # Errors
+    /// * [`ContractError::RateLimitExceeded`] — if insufficient tokens are available
+    fn check_issuer_rate_limit(
+        env: &Env,
+        issuer: &Address,
+        cost: u64,
+        refill_rate: u64,
+        max_burst: u64,
+    ) -> Result<(), ContractError> {
+        let key = DataKey::IssuerRateLimit(issuer.clone());
+        let current_time = env.ledger().timestamp() as u64;
+
+        let mut state = env
+            .storage()
+            .persistent()
+            .get::<DataKey, RateLimitState>(&key)
+            .unwrap_or_else(|| RateLimitState {
+                tokens: max_burst,
+                last_refill_secs: current_time,
+            });
+
+        // Calculate elapsed time and refill tokens
+        let elapsed = current_time.saturating_sub(state.last_refill_secs);
+        let refilled_tokens = state
+            .tokens
+            .saturating_add(elapsed.saturating_mul(refill_rate))
+            .min(max_burst);
+
+        state.tokens = refilled_tokens;
+        state.last_refill_secs = current_time;
+
+        // Try to consume cost
+        if state.tokens >= cost {
+            state.tokens -= cost;
+            env.storage().persistent().set(&key, &state);
+            Ok(())
+        } else {
+            Err(ContractError::RateLimitExceeded)
+        }
+    }
+
+    /// Check and consume tokens from the address's rate limit bucket.
+    ///
+    /// Uses the same token bucket algorithm as issuer limits.
+    ///
+    /// # Arguments
+    /// * `env`        - The Soroban environment
+    /// * `address`    - Address of the caller to rate-limit
+    /// * `cost`       - Tokens to consume for this operation
+    /// * `refill_rate` - Tokens added per second
+    /// * `max_burst`  - Maximum bucket capacity
+    ///
+    /// # Errors
+    /// * [`ContractError::RateLimitExceeded`] — if insufficient tokens are available
+    fn check_address_rate_limit(
+        env: &Env,
+        address: &Address,
+        cost: u64,
+        refill_rate: u64,
+        max_burst: u64,
+    ) -> Result<(), ContractError> {
+        let key = DataKey::AddressRateLimit(address.clone());
+        let current_time = env.ledger().timestamp() as u64;
+
+        let mut state = env
+            .storage()
+            .persistent()
+            .get::<DataKey, RateLimitState>(&key)
+            .unwrap_or_else(|| RateLimitState {
+                tokens: max_burst,
+                last_refill_secs: current_time,
+            });
+
+        // Calculate elapsed time and refill tokens
+        let elapsed = current_time.saturating_sub(state.last_refill_secs);
+        let refilled_tokens = state
+            .tokens
+            .saturating_add(elapsed.saturating_mul(refill_rate))
+            .min(max_burst);
+
+        state.tokens = refilled_tokens;
+        state.last_refill_secs = current_time;
+
+        // Try to consume cost
+        if state.tokens >= cost {
+            state.tokens -= cost;
+            env.storage().persistent().set(&key, &state);
+            Ok(())
+        } else {
+            Err(ContractError::RateLimitExceeded)
+        }
+    }
+
     /// Registers a new document on-chain, associating it with an issuer and owner.
     ///
     /// The issuer must authorize this call. Each document hash can only be registered once.
+    /// Rate limits are enforced per issuer and per owner address to prevent abuse.
     ///
     /// # Arguments
     /// * `env`           - The Soroban environment
@@ -160,6 +295,7 @@ impl ProofStellContract {
     ///
     /// # Errors
     /// * [`ContractError::AlreadyRegistered`] — if a record already exists for this hash
+    /// * [`ContractError::RateLimitExceeded`] — if issuer or owner has exceeded rate limits
     pub fn register_document(
         env: Env,
         issuer: Address,
@@ -168,6 +304,26 @@ impl ProofStellContract {
     ) -> Result<DocumentRecord, ContractError> {
         issuer.require_auth();
 
+        // ── Rate limit checks ──
+        // Check issuer rate limit
+        Self::check_issuer_rate_limit(
+            &env,
+            &issuer,
+            OPERATION_COST,
+            ISSUER_RATE_LIMIT_PER_SECOND,
+            ISSUER_RATE_LIMIT_BURST,
+        )?;
+
+        // Check owner (address) rate limit
+        Self::check_address_rate_limit(
+            &env,
+            &owner,
+            OPERATION_COST,
+            ADDRESS_RATE_LIMIT_PER_SECOND,
+            ADDRESS_RATE_LIMIT_BURST,
+        )?;
+
+        // ── Document registration ──
         let key = DataKey::Document(document_hash.clone());
 
         if env.storage().persistent().has(&key) {
@@ -257,7 +413,8 @@ impl ProofStellContract {
     /// Revokes a previously registered document, preventing future verification.
     ///
     /// Only the original issuer of the document may revoke it. A document that has
-    /// already been revoked cannot be revoked again.
+    /// already been revoked cannot be revoked again. Rate limits are enforced per issuer
+    /// to prevent revocation spam.
     ///
     /// # Arguments
     /// * `env`           - The Soroban environment
@@ -271,6 +428,7 @@ impl ProofStellContract {
     /// * [`ContractError::DocumentNotFound`]    — if no record exists for this hash
     /// * [`ContractError::OnlyIssuerCanRevoke`] — if the caller is not the original issuer
     /// * [`ContractError::AlreadyRevoked`]      — if the document is already revoked
+    /// * [`ContractError::RateLimitExceeded`]   — if issuer has exceeded rate limits
     pub fn revoke_document(
         env: Env,
         issuer: Address,
@@ -278,6 +436,17 @@ impl ProofStellContract {
     ) -> Result<DocumentRecord, ContractError> {
         issuer.require_auth();
 
+        // ── Rate limit check ──
+        // Only check issuer rate limit for revocation (not address, as revocation is issuer-initiated)
+        Self::check_issuer_rate_limit(
+            &env,
+            &issuer,
+            OPERATION_COST,
+            ISSUER_RATE_LIMIT_PER_SECOND,
+            ISSUER_RATE_LIMIT_BURST,
+        )?;
+
+        // ── Document revocation ──
         let key = DataKey::Document(document_hash.clone());
 
         let mut record: DocumentRecord = env
@@ -420,6 +589,7 @@ impl ProofStellContract {
             }
 
             record.status = DocumentStatus::Revoked;
+
             env.storage().persistent().set(&key, &record);
             DocumentRevoked {
                 issuer: issuer.clone(),
@@ -427,11 +597,644 @@ impl ProofStellContract {
             }
             .publish(&env);
 
-            records.push_back(record);
+            records.push_back(record.clone());
         }
 
         Ok(records)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, BytesN as _, Ledger as _};
+    use soroban_sdk::{vec, IntoVal, Symbol};
+
+    // Define a setup function to avoid code duplication
+    fn setup() -> (
+        Env,
+        ProofStellContractClient,
+        Address,
+        Address,
+        BytesN<32>,
+    ) {
+        let env = Env::default();
+        env.ledger().with_mut(|li| {
+            li.timestamp = 12345;
+        });
+        let client = ProofStellContractClient::new(&env, &env.register_contract(None, ProofStellContract));
+        let issuer = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let document_hash = BytesN::from_array(&env, &[1; 32]);
+        (env, client, issuer, owner, document_hash)
+    }
+
+    // --- register_document ---
+
+    #[test]
+    fn register_document_succeeds() {
+        let (env, client, issuer, owner, document_hash) = setup();
+
+        let record = client.register_document(&issuer, &owner, &document_hash);
+
+        assert_eq!(record.issuer, issuer);
+        assert_eq!(record.owner, owner);
+        assert_eq!(record.status, DocumentStatus::Active);
+        assert_eq!(record.timestamp, 12345);
+
+        let stored_record = client.get_document(&document_hash).unwrap();
+        assert_eq!(stored_record, record);
+    }
+
+    #[test]
+    fn register_document_twice_fails() {
+        let (env, client, issuer, owner, document_hash) = setup();
+
+        client.register_document(&issuer, &owner, &document_hash);
+        let err = client
+            .try_register_document(&issuer, &owner, &document_hash)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::AlreadyRegistered);
+    }
+
+    #[test]
+    fn register_document_requires_issuer_auth() {
+        let (env, client, _, owner, document_hash) = setup();
+        let unauth_issuer = Address::generate(&env);
+
+        // This will panic because `unauth_issuer` did not authorize the call
+        let result = client.try_register_document(&unauth_issuer, &owner, &document_hash);
+        assert!(result.is_err());
+    }
+
+    // --- get_document ---
+
+    #[test]
+    fn get_document_not_found() {
+        let (_env, client, _, _, document_hash) = setup();
+        assert_eq!(client.get_document(&document_hash), None);
+    }
+
+    // --- verify_document ---
+
+    #[test]
+    fn verify_document_active() {
+        let (_env, client, issuer, owner, document_hash) = setup();
+        client.register_document(&issuer, &owner, &document_hash);
+        assert!(client.verify_document(&document_hash));
+    }
+
+    #[test]
+    fn verify_document_revoked() {
+        let (_env, client, issuer, owner, document_hash) = setup();
+        client.register_document(&issuer, &owner, &document_hash);
+        client.revoke_document(&issuer, &document_hash);
+        assert!(!client.verify_document(&document_hash));
+    }
+
+    #[test]
+    fn verify_document_not_found() {
+        let (_env, client, _, _, document_hash) = setup();
+        assert!(!client.verify_document(&document_hash));
+    }
+
+    // --- get_document_status ---
+
+    #[test]
+    fn get_document_status_succeeds() {
+        let (_env, client, issuer, owner, document_hash) = setup();
+        client.register_document(&issuer, &owner, &document_hash);
+        assert_eq!(
+            client.get_document_status(&document_hash),
+            Ok(DocumentStatus::Active)
+        );
+
+        client.revoke_document(&issuer, &document_hash);
+        assert_eq!(
+            client.get_document_status(&document_hash),
+            Ok(DocumentStatus::Revoked)
+        );
+    }
+
+    #[test]
+    fn get_document_status_not_found() {
+        let (_env, client, _, _, document_hash) = setup();
+        assert_eq!(
+            client.try_get_document_status(&document_hash),
+            Err(Ok(ContractError::DocumentNotFound))
+        );
+    }
+
+    // --- document_exists ---
+
+    #[test]
+    fn document_exists_is_true_for_active_and_revoked() {
+        let (_env, client, issuer, owner, document_hash) = setup();
+        client.register_document(&issuer, &owner, &document_hash);
+        assert!(client.document_exists(&document_hash));
+
+        client.revoke_document(&issuer, &document_hash);
+        assert!(client.document_exists(&document_hash));
+    }
+
+    #[test]
+    fn document_exists_is_false_for_nonexistent() {
+        let (_env, client, _, _, document_hash) = setup();
+        assert!(!client.document_exists(&document_hash));
+    }
+
+    // --- revoke_document ---
+
+    #[test]
+    fn revoke_document_succeeds() {
+        let (_env, client, issuer, owner, document_hash) = setup();
+        client.register_document(&issuer, &owner, &document_hash);
+
+        let record = client.revoke_document(&issuer, &document_hash);
+
+        assert_eq!(record.status, DocumentStatus::Revoked);
+        let stored_record = client.get_document(&document_hash).unwrap();
+        assert_eq!(stored_record.status, DocumentStatus::Revoked);
+    }
+
+    #[test]
+    fn revoke_document_not_found() {
+        let (_env, client, issuer, _, document_hash) = setup();
+        let err = client
+            .try_revoke_document(&issuer, &document_hash)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::DocumentNotFound);
+    }
+
+    #[test]
+    fn revoke_document_already_revoked() {
+        let (_env, client, issuer, owner, document_hash) = setup();
+        client.register_document(&issuer, &owner, &document_hash);
+        client.revoke_document(&issuer, &document_hash);
+
+        let err = client
+            .try_revoke_document(&issuer, &document_hash)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::AlreadyRevoked);
+    }
+
+    #[test]
+    fn revoke_document_wrong_issuer() {
+        let (env, client, issuer, owner, document_hash) = setup();
+        let other_issuer = Address::generate(&env);
+        client.register_document(&issuer, &owner, &document_hash);
+
+        let err = client
+            .try_revoke_document(&other_issuer, &document_hash)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::OnlyIssuerCanRevoke);
+    }
+
+    // --- rate limiting ---
+
+    #[test]
+    fn per_issuer_rate_limit_works() {
+        let (env, client, issuer, _, _) = setup();
+
+        // Exhaust the burst limit
+        for i in 0..ISSUER_RATE_LIMIT_BURST {
+            let hash = BytesN::from_array(&env, &[i as u8; 32]);
+            let owner = Address::generate(&env); // Use a new owner for each registration
+            client.register_document(&issuer, &owner, &hash);
+        }
+
+        // The next call should fail
+        let hash = BytesN::from_array(&env, &[255; 32]);
+        let owner = Address::generate(&env);
+        let err = client
+            .try_register_document(&issuer, &owner, &hash)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::RateLimitExceeded);
+    }
+
+    #[test]
+    fn per_address_rate_limit_works() {
+        let (env, client, _, owner, _) = setup();
+
+        // Exhaust the burst limit
+        for i in 0..ADDRESS_RATE_LIMIT_BURST {
+            let hash = BytesN::from_array(&env, &[i as u8; 32]);
+            let issuer = Address::generate(&env); // Use a new issuer for each registration
+            client.register_document(&issuer, &owner, &hash);
+        }
+
+        // The next call should fail
+        let hash = BytesN::from_array(&env, &[255; 32]);
+        let issuer = Address::generate(&env);
+        let err = client
+            .try_register_document(&issuer, &owner, &hash)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::RateLimitExceeded);
+    }
+
+    #[test]
+    fn per_issuer_rate_limits_are_independent() {
+        let (env, client, _, _owner, _) = setup();
+        let issuer1 = Address::generate(&env);
+        let issuer2 = Address::generate(&env);
+
+        // Exhaust the burst limit for the first issuer
+        for i in 0..ISSUER_RATE_LIMIT_BURST {
+            let hash = BytesN::from_array(&env, &[i as u8; 32]);
+            let owner = Address::generate(&env); // Use a new owner for each registration
+            client.register_document(&issuer1, &owner, &hash);
+        }
+
+        // The second issuer should still be able to register
+        let hash = BytesN::from_array(&env, &[255; 32]);
+        let owner = Address::generate(&env);
+        let result = client.try_register_document(&issuer2, &owner, &hash);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn per_address_rate_limits_are_independent() {
+        let (env, client, _issuer, _, _) = setup();
+        let owner1 = Address::generate(&env);
+        let owner2 = Address::generate(&env);
+
+        // Exhaust the burst limit for the first owner
+        for i in 0..ADDRESS_RATE_LIMIT_BURST {
+            let hash = BytesN::from_array(&env, &[i as u8; 32]);
+            let issuer = Address::generate(&env); // Use a new issuer for each registration
+            client.register_document(&issuer, &owner1, &hash);
+        }
+
+        // The second owner should still be able to register
+        let hash = BytesN::from_array(&env, &[255; 32]);
+        let issuer = Address::generate(&env);
+        let result = client.try_register_document(&issuer, &owner2, &hash);
+        assert!(result.is_ok());
+    }
+
+    // --- batch_register_documents ---
+
+    #[test]
+    fn batch_register_all_succeed() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let docs = soroban_sdk::vec![
+            &env,
+            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[1; 32]) },
+            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[2; 32]) },
+            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[3; 32]) },
+        ];
+
+        let records = client.batch_register_documents(&issuer, &docs);
+
+        assert_eq!(records.len(), 3);
+        for record in records.iter() {
+            assert_eq!(record.status, DocumentStatus::Active);
+            assert_eq!(record.issuer, issuer);
+        }
+    }
+
+    #[test]
+    fn batch_register_fails_on_duplicate() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hash1 = BytesN::from_array(&env, &[1; 32]);
+        let hash2 = BytesN::from_array(&env, &[2; 32]);
+        client.register_document(&issuer, &owner, &hash1);
+
+        let docs = soroban_sdk::vec![
+            &env,
+            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[3; 32]) },
+            DocumentInfo { owner: owner.clone(), document_hash: hash1.clone() },
+            DocumentInfo { owner: owner.clone(), document_hash: hash2.clone() },
+        ];
+
+        let err = client
+            .try_batch_register_documents(&issuer, &docs)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::AlreadyRegistered);
+        // hash2 must not have been stored (batch was atomic)
+        assert!(!client.document_exists(&hash2));
+    }
+
+    #[test]
+    fn batch_register_rejects_empty() {
+        let (env, client, issuer, _, _) = setup();
+
+        let docs: soroban_sdk::Vec<DocumentInfo> = soroban_sdk::vec![&env];
+        let err = client
+            .try_batch_register_documents(&issuer, &docs)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::BatchEmpty);
+    }
+
+    #[test]
+    fn batch_register_rejects_oversized() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let mut docs = soroban_sdk::vec![&env];
+        for i in 0..21u8 {
+            docs.push_back(DocumentInfo {
+                owner: owner.clone(),
+                document_hash: BytesN::from_array(&env, &[i; 32]),
+            });
+        }
+
+        let err = client
+            .try_batch_register_documents(&issuer, &docs)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::BatchTooLarge);
+    }
+
+    // --- batch_revoke_documents ---
+
+    #[test]
+    fn batch_revoke_all_succeed() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hashes = [
+            BytesN::from_array(&env, &[1; 32]),
+            BytesN::from_array(&env, &[2; 32]),
+            BytesN::from_array(&env, &[3; 32]),
+        ];
+        for h in &hashes {
+            client.register_document(&issuer, &owner, h);
+        }
+
+        let hash_vec = soroban_sdk::vec![&env, hashes[0].clone(), hashes[1].clone(), hashes[2].clone()];
+        let records = client.batch_revoke_documents(&issuer, &hash_vec);
+
+        assert_eq!(records.len(), 3);
+        for record in records.iter() {
+            assert_eq!(record.status, DocumentStatus::Revoked);
+        }
+    }
+
+    #[test]
+    fn batch_revoke_fails_on_missing() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hash1 = BytesN::from_array(&env, &[1; 32]);
+        let hash_missing = BytesN::from_array(&env, &[99; 32]);
+        client.register_document(&issuer, &owner, &hash1);
+
+        let hash_vec = soroban_sdk::vec![&env, hash1.clone(), hash_missing];
+        let err = client
+            .try_batch_revoke_documents(&issuer, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::DocumentNotFound);
+        // hash1 must still be Active (batch was atomic)
+        assert_eq!(client.get_document_status(&hash1), DocumentStatus::Active);
+    }
+
+    #[test]
+    fn batch_revoke_fails_on_wrong_issuer() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hash1 = BytesN::from_array(&env, &[1; 32]);
+        let hash2 = BytesN::from_array(&env, &[2; 32]);
+        client.register_document(&issuer, &owner, &hash1);
+        client.register_document(&issuer, &owner, &hash2);
+
+        let other = Address::generate(&env);
+        let hash_vec = soroban_sdk::vec![&env, hash1.clone(), hash2.clone()];
+        let err = client
+            .try_batch_revoke_documents(&other, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::OnlyIssuerCanRevoke);
+        assert_eq!(client.get_document_status(&hash1), DocumentStatus::Active);
+    }
+
+    #[test]
+    fn batch_revoke_fails_on_already_revoked() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hash1 = BytesN::from_array(&env, &[1; 32]);
+        let hash2 = BytesN::from_array(&env, &[2; 32]);
+        client.register_document(&issuer, &owner, &hash1);
+        client.register_document(&issuer, &owner, &hash2);
+        client.revoke_document(&issuer, &hash1);
+
+        let hash_vec = soroban_sdk::vec![&env, hash1, hash2.clone()];
+        let err = client
+            .try_batch_revoke_documents(&issuer, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::AlreadyRevoked);
+        assert_eq!(client.get_document_status(&hash2), DocumentStatus::Active);
+    }
+
+    #[test]
+    fn batch_revoke_rejects_empty() {
+        let (env, client, issuer, _, _) = setup();
+
+        let hash_vec: soroban_sdk::Vec<BytesN<32>> = soroban_sdk::vec![&env];
+        let err = client
+            .try_batch_revoke_documents(&issuer, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::BatchEmpty);
+    }
+
+    #[test]
+    fn batch_revoke_rejects_oversized() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let mut hash_vec: soroban_sdk::Vec<BytesN<32>> = soroban_sdk::vec![&env];
+        for i in 0..21u8 {
+            let h = BytesN::from_array(&env, &[i; 32]);
+            client.register_document(&issuer, &owner, &h);
+            hash_vec.push_back(h);
+        }
+
+        let err = client
+            .try_batch_revoke_documents(&issuer, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::BatchTooLarge);
+    }
+
+    // --- initialize / get_version / get_admin ---
+
+    #[test]
+    fn initialize_sets_admin_and_version() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        assert_eq!(client.get_version(), 1);
+        assert_eq!(client.get_admin(), Some(admin));
+    }
+
+    #[test]
+    fn get_version_returns_zero_before_init() {
+        let (_env, client, _, _, _) = setup();
+        assert_eq!(client.get_version(), 0);
+    }
+
+    #[test]
+    fn get_admin_returns_none_before_init() {
+        let (_env, client, _, _, _) = setup();
+        assert_eq!(client.get_admin(), None);
+    }
+
+    #[test]
+    fn double_initialize_fails() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        let err = client.try_initialize(&admin).unwrap_err().unwrap();
+        assert_eq!(err, ContractError::AlreadyInitialized);
+    }
+
+    // --- upgrade ---
+
+    #[test]
+    fn upgrade_requires_initialization() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+        let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        let err = client
+            .try_upgrade(&admin, &wasm_hash)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::NotInitialized);
+    }
+
+    #[test]
+    fn non_admin_cannot_upgrade() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+        let other = Address::generate(&env);
+        let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        client.initialize(&admin);
+
+        let err = client
+            .try_upgrade(&other, &wasm_hash)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::Unauthorized);
+    }
+
+    // --- migrate ---
+
+    #[test]
+    fn migrate_v0_to_v1_sets_versioning() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+
+        // Simulate pre-versioned state: no initialize called, DataKey::Version absent.
+        let new_version = client.migrate(&admin);
+
+        assert_eq!(new_version, 1);
+        assert_eq!(client.get_version(), 1);
+        assert_eq!(client.get_admin(), Some(admin));
+    }
+
+    #[test]
+    fn migrate_already_current_fails() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        let err = client.try_migrate(&admin).unwrap_err().unwrap();
+        assert_eq!(err, ContractError::MigrationNotNeeded);
+    }
+
+    #[test]
+    fn documents_still_work_after_migration() {
+        let (env, client, issuer, owner, document_hash) = setup();
+        let admin = Address::generate(&env);
+
+        // Register a document before any versioning is set up.
+        client.register_document(&issuer, &owner, &document_hash);
+
+        // Migrate from v0 to v1.
+        client.migrate(&admin);
+
+        // Document still verifiable after migration.
+        assert!(client.verify_document(&document_hash));
+        assert_eq!(client.get_document_status(&document_hash), DocumentStatus::Active);
+    }
+
+    // --- feature flags ---
+
+    #[test]
+    fn get_feature_flag_returns_false_for_unset() {
+        let (env, client, _, _, _) = setup();
+        let flag = Symbol::new(&env, "batch_ops");
+        assert!(!client.get_feature_flag(&flag));
+    }
+
+    #[test]
+    fn admin_can_set_and_get_feature_flag() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+        let flag = Symbol::new(&env, "batch_ops");
+
+        client.initialize(&admin);
+        client.set_feature_flag(&admin, &flag, &true);
+
+        assert!(client.get_feature_flag(&flag));
+    }
+
+    #[test]
+    fn non_admin_cannot_set_feature_flag() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+        let other = Address::generate(&env);
+        let flag = Symbol::new(&env, "batch_ops");
+
+        client.initialize(&admin);
+
+        let err = client
+            .try_set_feature_flag(&other, &flag, &true)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::Unauthorized);
+    }
+
+    #[test]
+    fn set_feature_flag_requires_initialization() {
+        let (env, client, _, _, _) = setup();
+        let admin = Address::generate(&env);
+        let flag = Symbol::new(&env, "batch_ops");
+
+        let err = client
+            .try_set_feature_flag(&admin, &flag, &true)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::NotInitialized);
+    }
+}
 
     /// Initializes the contract for a new deployment, setting the admin and contract version.
     ///
@@ -611,14 +1414,14 @@ impl ProofStellContract {
             .get::<DataKey, bool>(&DataKey::FeatureFlag(flag))
             .unwrap_or(false)
     }
-}
 
 #[cfg(test)]
 mod tests {
     extern crate std;
+    use std::vec::Vec;
 
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Address, Env};
+    use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Env};
 
     fn setup() -> (
         Env,
@@ -773,6 +1576,104 @@ mod tests {
         client.register_document(&issuer, &owner, &document_hash);
 
         assert!(client.document_exists(&document_hash));
+    }
+
+
+    // ── Rate limiting tests ──────────────────────────────────────────────
+
+    #[test]
+    fn register_respects_issuer_rate_limit_burst() {
+        let (env, client, issuer, owner, _) = setup();
+
+        // Create and register documents up to the issuer burst limit
+        for i in 0..ISSUER_RATE_LIMIT_BURST {
+            let hash = BytesN::from_array(&env, &[i as u8; 32]);
+            let result = client.try_register_document(&issuer, &owner, &hash);
+            assert!(result.is_ok(), "registration {} should succeed", i);
+        }
+
+        // The next attempt should fail
+        let hash = BytesN::from_array(&env, &[255; 32]);
+        let err = client
+            .try_register_document(&issuer, &owner, &hash)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::RateLimitExceeded);
+    }
+
+    #[test]
+    fn revoke_respects_issuer_rate_limit_burst() {
+        let (env, client, issuer, owner, _) = setup();
+
+        // Register a batch of documents, one more than the burst limit,
+        // so we have one to try to revoke after exhausting the bucket.
+        let hashes: Vec<BytesN<32>> = (0..=ISSUER_RATE_LIMIT_BURST)
+            .map(|i| {
+                let hash = BytesN::from_array(&env, &[i as u8; 32]);
+                // We don't check the result here, as the last one is expected to fail.
+                let _ = client.try_register_document(&issuer, &owner, &hash);
+                hash
+            })
+            .collect();
+
+        // Advance time to let the issuer's token bucket refill.
+        env.ledger().set_timestamp(env.ledger().timestamp() + 5);
+
+        // Revoke documents up to the burst limit.
+        for (i, hash) in hashes.iter().enumerate().take(ISSUER_RATE_LIMIT_BURST as usize) {
+            let result = client.try_revoke_document(&issuer, &hash);
+            assert!(result.is_ok(), "revocation {} should succeed", i);
+        }
+
+        // The next revocation should fail as the bucket is now empty.
+        let last_hash = hashes.last().unwrap();
+        let err = client
+            .try_revoke_document(&issuer, &last_hash)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::RateLimitExceeded);
+    }
+
+    #[test]
+    fn per_issuer_rate_limits_are_independent() {
+        let (env, client, _, _owner, _) = setup();
+        let issuer1 = Address::generate(&env);
+        let issuer2 = Address::generate(&env);
+
+        // Exhaust the burst limit for the first issuer
+        for i in 0..ISSUER_RATE_LIMIT_BURST {
+            let hash = BytesN::from_array(&env, &[i as u8; 32]);
+            let owner = Address::generate(&env); // Use a new owner for each registration
+            client.register_document(&issuer1, &owner, &hash);
+        }
+
+        // The second issuer should still be able to register
+        let hash = BytesN::from_array(&env, &[255; 32]);
+        let owner = Address::generate(&env);
+        let result = client.try_register_document(&issuer2, &owner, &hash);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn per_address_rate_limits_are_independent() {
+        let (env, client, _issuer, _, _) = setup();
+        let owner1 = Address::generate(&env);
+        let owner2 = Address::generate(&env);
+
+        // Exhaust the burst limit for the first owner
+        for i in 0..ADDRESS_RATE_LIMIT_BURST {
+            let hash = BytesN::from_array(&env, &[i as u8; 32]);
+            let issuer = Address::generate(&env); // Use a new issuer for each registration
+            client.register_document(&issuer, &owner1, &hash);
+        }
+
+        // The second owner should still be able to register
+        let hash = BytesN::from_array(&env, &[255; 32]);
+        let issuer = Address::generate(&env);
+        let result = client.try_register_document(&issuer, &owner2, &hash);
+        assert!(result.is_ok());
     }
 
     // --- batch_register_documents ---

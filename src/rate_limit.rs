@@ -3,6 +3,7 @@ use std::prelude::v1::*;
 use std::sync::Arc;
 
 use governor::{Quota, RateLimiter};
+use serde::{Deserialize, Serialize};
 
 use crate::metrics::MetricsRegistry;
 
@@ -12,6 +13,71 @@ pub type DefaultRateLimiter = RateLimiter<
     governor::state::InMemoryState,
     governor::clock::QuantaClock,
 >;
+
+/// Result of a rate limit check operation.
+///
+/// When a rate limit is exceeded, the `retry_after_secs` field indicates
+/// how many seconds the caller should wait before retrying.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitExceededInfo {
+    /// Estimated seconds to wait before a token will be available
+    pub retry_after_secs: u64,
+}
+
+impl RateLimitExceededInfo {
+    /// Create a new rate limit exceeded info with the given retry-after duration.
+    pub fn new(retry_after_secs: u64) -> Self {
+        Self { retry_after_secs }
+    }
+}
+
+/// Token bucket state for a single issuer or address.
+///
+/// Tracks tokens available and the last refill timestamp, enabling
+/// token bucket algorithm implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenBucketState {
+    /// Number of tokens currently available (0.0 to max_burst)
+    pub tokens: u64,
+    /// Unix timestamp of last token refill
+    pub last_refill_secs: u64,
+}
+
+impl TokenBucketState {
+    /// Create a new token bucket in its fully charged state.
+    pub fn new_full(max_burst: u64) -> Self {
+        Self {
+            tokens: max_burst,
+            last_refill_secs: 0, // Will be set on first check
+        }
+    }
+
+    /// Compute the number of tokens to refill based on elapsed time.
+    ///
+    /// Returns the new tokens available and updated timestamp, clamped to max_burst.
+    pub fn refill(
+        &self,
+        elapsed_secs: u64,
+        refill_rate: u64,
+        max_burst: u64,
+    ) -> (u64, u64) {
+        let refilled = self.tokens + (elapsed_secs * refill_rate);
+        (refilled.min(max_burst), elapsed_secs)
+    }
+
+    /// Attempt to consume `cost` tokens. Returns the updated state if successful,
+    /// or the current state if insufficient tokens are available.
+    pub fn try_consume(&self, cost: u64) -> Result<Self, Self> {
+        if self.tokens >= cost {
+            Ok(Self {
+                tokens: self.tokens - cost,
+                last_refill_secs: self.last_refill_secs,
+            })
+        } else {
+            Err(*self)
+        }
+    }
+}
 
 /// A metrics-aware wrapper around `governor::RateLimiter`.
 ///
@@ -65,16 +131,71 @@ impl MetricsRateLimiter {
     }
 }
 
-/// Build a bare `governor::RateLimiter` without metrics (legacy compatibility).
-pub fn build_rate_limiter(per_second: u32, burst: u32) -> DefaultRateLimiter {
-    let quota = Quota::per_second(NonZeroU32::new(per_second.max(1)).unwrap())
-        .allow_burst(NonZeroU32::new(burst.max(1)).unwrap());
-    RateLimiter::direct(quota)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── TokenBucketState tests ──
+
+    #[test]
+    fn token_bucket_new_full_creates_fully_charged_bucket() {
+        let bucket = TokenBucketState::new_full(100);
+        assert_eq!(bucket.tokens, 100);
+        assert_eq!(bucket.last_refill_secs, 0);
+    }
+
+    #[test]
+    fn token_bucket_refill_adds_tokens() {
+        let bucket = TokenBucketState {
+            tokens: 50,
+            last_refill_secs: 10,
+        };
+        let (new_tokens, new_ts) = bucket.refill(5, 10, 100);
+        assert_eq!(new_tokens, 100); // 50 + (5 * 10) = 100, clamped at max_burst
+        assert_eq!(new_ts, 5);
+    }
+
+    #[test]
+    fn token_bucket_refill_respects_max_burst() {
+        let bucket = TokenBucketState {
+            tokens: 80,
+            last_refill_secs: 10,
+        };
+        let (new_tokens, _) = bucket.refill(10, 10, 100);
+        assert_eq!(new_tokens, 100); // Clamped at max_burst
+    }
+
+    #[test]
+    fn token_bucket_try_consume_succeeds_with_sufficient_tokens() {
+        let bucket = TokenBucketState {
+            tokens: 50,
+            last_refill_secs: 10,
+        };
+        let result = bucket.try_consume(30);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().tokens, 20);
+    }
+
+    #[test]
+    fn token_bucket_try_consume_fails_with_insufficient_tokens() {
+        let bucket = TokenBucketState {
+            tokens: 10,
+            last_refill_secs: 10,
+        };
+        let result = bucket.try_consume(20);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), bucket);
+    }
+
+    // ── RateLimitExceededInfo tests ──
+
+    #[test]
+    fn rate_limit_exceeded_info_creation() {
+        let info = RateLimitExceededInfo::new(30);
+        assert_eq!(info.retry_after_secs, 30);
+    }
+
+    // ── MetricsRateLimiter tests ──
 
     #[test]
     fn metrics_rate_limiter_consumes_token_on_check() {
@@ -100,12 +221,6 @@ mod tests {
         assert!(output.contains("rate_limit_violations_total"));
     }
 
-    #[test]
-    fn build_rate_limiter_creates_valid_limiter() {
-        let rl = build_rate_limiter(10, 10);
-        assert!(rl.check().is_ok());
-    }
-
     #[tokio::test]
     async fn until_ready_consumes_token() {
         let metrics = MetricsRegistry::arc();
@@ -123,3 +238,4 @@ mod tests {
         assert!(rl.check().is_ok());
     }
 }
+

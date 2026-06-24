@@ -36,6 +36,10 @@ pub struct MetricsRegistry {
     // ── Rate limiter metrics ──
     rate_limit_tokens_consumed: IntCounter,
     rate_limit_violations: IntCounter,
+    issuer_rate_limit_violations: IntCounter,
+    address_rate_limit_violations: IntCounter,
+    issuer_rate_limit_resets: IntCounter,
+    address_rate_limit_resets: IntCounter,
 
     // ── Event ingestion metrics ──
     event_duplicates: IntCounter,
@@ -138,6 +142,30 @@ impl MetricsRegistry {
         )
         .unwrap();
 
+        let issuer_rate_limit_violations = IntCounter::new(
+            "issuer_rate_limit_violations_total",
+            "Total per-issuer rate limit violations",
+        )
+        .unwrap();
+
+        let address_rate_limit_violations = IntCounter::new(
+            "address_rate_limit_violations_total",
+            "Total per-address rate limit violations",
+        )
+        .unwrap();
+
+        let issuer_rate_limit_resets = IntCounter::new(
+            "issuer_rate_limit_resets_total",
+            "Total per-issuer rate limit bucket refills from exhaustion",
+        )
+        .unwrap();
+
+        let address_rate_limit_resets = IntCounter::new(
+            "address_rate_limit_resets_total",
+            "Total per-address rate limit bucket refills from exhaustion",
+        )
+        .unwrap();
+
         // ── Event ingestion metrics ──
         let event_duplicates = IntCounter::new(
             "event_duplicates_total",
@@ -214,6 +242,18 @@ impl MetricsRegistry {
             .register(Box::new(rate_limit_violations.clone()))
             .unwrap();
         registry
+            .register(Box::new(issuer_rate_limit_violations.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(address_rate_limit_violations.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(issuer_rate_limit_resets.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(address_rate_limit_resets.clone()))
+            .unwrap();
+        registry
             .register(Box::new(event_duplicates.clone()))
             .unwrap();
         registry
@@ -245,6 +285,10 @@ impl MetricsRegistry {
             retry_total,
             rate_limit_tokens_consumed,
             rate_limit_violations,
+            issuer_rate_limit_violations,
+            address_rate_limit_violations,
+            issuer_rate_limit_resets,
+            address_rate_limit_resets,
             event_duplicates,
             event_ordering_failures,
             event_backlog_size,
@@ -327,6 +371,22 @@ impl MetricsRegistry {
 
     pub fn increment_rate_limit_violation(&self) {
         self.rate_limit_violations.inc();
+    }
+
+    pub fn increment_issuer_rate_limit_violation(&self) {
+        self.issuer_rate_limit_violations.inc();
+    }
+
+    pub fn increment_address_rate_limit_violation(&self) {
+        self.address_rate_limit_violations.inc();
+    }
+
+    pub fn increment_issuer_rate_limit_reset(&self) {
+        self.issuer_rate_limit_resets.inc();
+    }
+
+    pub fn increment_address_rate_limit_reset(&self) {
+        self.address_rate_limit_resets.inc();
     }
 
     // ── Event ingestion metrics ──────────────────────────────────────────
