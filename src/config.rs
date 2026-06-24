@@ -16,6 +16,10 @@ pub struct AppConfig {
     pub redis_url: String,
     pub rate_limit_per_second: u32,
     pub rate_limit_burst: u32,
+    /// Per-issuer rate limit: max operations per second per issuer address
+    pub rate_limit_per_issuer_per_second: u32,
+    /// Per-issuer burst allowance: max concurrent operations per issuer
+    pub rate_limit_per_issuer_burst: u32,
     pub stellar_max_retries: u32,
     pub log_level: String,
     pub webhook_urls: Vec<String>,
@@ -35,6 +39,8 @@ impl fmt::Debug for AppConfig {
             .field("redis_url", &self.redis_url)
             .field("rate_limit_per_second", &self.rate_limit_per_second)
             .field("rate_limit_burst", &self.rate_limit_burst)
+            .field("rate_limit_per_issuer_per_second", &self.rate_limit_per_issuer_per_second)
+            .field("rate_limit_per_issuer_burst", &self.rate_limit_per_issuer_burst)
             .field("stellar_max_retries", &self.stellar_max_retries)
             .field("log_level", &self.log_level)
             .field("webhook_urls", &self.webhook_urls)
@@ -104,6 +110,12 @@ impl AppConfig {
         let rate_limit_per_second_raw = get_env_or_default("RATE_LIMIT_PER_SECOND", "10");
         let rate_limit_burst_raw =
             get_env_or_default("RATE_LIMIT_BURST", &rate_limit_per_second_raw);
+        let rate_limit_per_issuer_per_second_raw =
+            get_env_or_default("RATE_LIMIT_PER_ISSUER_PER_SECOND", "100");
+        let rate_limit_per_issuer_burst_raw = get_env_or_default(
+            "RATE_LIMIT_PER_ISSUER_BURST",
+            &rate_limit_per_issuer_per_second_raw,
+        );
         let stellar_max_retries_raw = get_env_or_default("STELLAR_MAX_RETRIES", "3");
         let cache_verification_ttl_raw = get_env_or_default("CACHE_VERIFICATION_TTL", "3600");
 
@@ -152,6 +164,41 @@ impl AppConfig {
                     rate_limit_burst_raw
                 ));
                 rate_limit_per_second
+            }
+        };
+
+        let rate_limit_per_issuer_per_second: u32 =
+            match rate_limit_per_issuer_per_second_raw.parse() {
+                Ok(v) if v > 0 => v,
+                Ok(_) => {
+                    errors.push(
+                        "RATE_LIMIT_PER_ISSUER_PER_SECOND must be greater than 0".to_string(),
+                    );
+                    100
+                }
+                Err(_) => {
+                    errors.push(format!(
+                        "RATE_LIMIT_PER_ISSUER_PER_SECOND must be a valid u32, got '{}'",
+                        rate_limit_per_issuer_per_second_raw
+                    ));
+                    100
+                }
+            };
+
+        let rate_limit_per_issuer_burst: u32 = match rate_limit_per_issuer_burst_raw.parse() {
+            Ok(v) if v > 0 => v,
+            Ok(_) => {
+                errors.push(
+                    "RATE_LIMIT_PER_ISSUER_BURST must be greater than 0".to_string(),
+                );
+                rate_limit_per_issuer_per_second
+            }
+            Err(_) => {
+                errors.push(format!(
+                    "RATE_LIMIT_PER_ISSUER_BURST must be a valid u32, got '{}'",
+                    rate_limit_per_issuer_burst_raw
+                ));
+                rate_limit_per_issuer_per_second
             }
         };
 
@@ -223,6 +270,8 @@ impl AppConfig {
             redis_url,
             rate_limit_per_second,
             rate_limit_burst,
+            rate_limit_per_issuer_per_second,
+            rate_limit_per_issuer_burst,
             stellar_max_retries,
             log_level,
             webhook_urls,
@@ -247,6 +296,8 @@ mod tests {
             "REDIS_URL",
             "RATE_LIMIT_PER_SECOND",
             "RATE_LIMIT_BURST",
+            "RATE_LIMIT_PER_ISSUER_PER_SECOND",
+            "RATE_LIMIT_PER_ISSUER_BURST",
             "STELLAR_MAX_RETRIES",
             "LOG_LEVEL",
             "WEBHOOK_URLS",

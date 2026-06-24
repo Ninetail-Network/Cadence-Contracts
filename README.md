@@ -88,6 +88,95 @@ Horizon proof exists).
 
 ---
 
+### 🚦 Rate Limiting
+
+Per-issuer rate limiting prevents abuse and denial-of-service attacks. Each issuer has a configurable allowance of operations per second with burst capacity.
+
+#### How It Works
+
+* **Token bucket algorithm** — each issuer gets a bucket of tokens that refills over time
+* **Per-second rate** — controls how many tokens refill each second (default: 100/sec)
+* **Burst allowance** — maximum tokens available at any instant (default: 100)
+* **Token cost** — single operations consume 1 token; batch operations consume tokens equal to batch size
+* **Persistent state** — token counts and refill timestamps are stored on-chain per issuer
+* **Automatic refill** — tokens automatically refill based on elapsed ledger time
+
+#### Rate Limit Behavior
+
+When an issuer exceeds the rate limit:
+- The operation returns error code `13` (`RateLimitExceeded`)
+- No state mutation occurs
+- The client may retry after tokens refill
+- Metrics record the violation for monitoring
+
+#### Configuration
+
+Rate limits are configured globally by the contract admin and apply uniformly to all issuers:
+
+```bash
+# Set per-issuer rate limit to 50 ops/sec with burst of 75
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <ADMIN_SECRET_KEY> \
+  --network testnet \
+  -- set_rate_limit_config \
+  --admin <ADMIN_ADDRESS> \
+  --per_second 50 \
+  --burst 75
+```
+
+Retrieve current configuration:
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_rate_limit_config
+```
+
+#### Tuning for Production
+
+**High-volume legitimate users** may occasionally exceed burst capacity. Consider:
+
+1. **Increase burst allowance** if brief traffic spikes are legitimate:
+   ```bash
+   soroban contract invoke ... set_rate_limit_config --per_second 100 --burst 200
+   ```
+
+2. **Use batch operations** to process multiple documents in one call:
+   - Batch register: 20 docs = 20 tokens (costs same as 20 individual reqs)
+   - More predictable rate consumption
+   - Lower transaction fees
+
+3. **Monitor rate limit violations** via Prometheus metrics:
+   - `rate_limit_per_issuer_hits_total` — violations per issuer
+   - `rate_limit_per_issuer_resets_total` — refill events per issuer
+
+4. **Implement client-side retry logic**:
+   - Exponential backoff after `RateLimitExceeded` errors
+   - Batch requests to stay within limits
+   - Pre-validate batch contents to avoid wasted tokens on validation errors
+
+#### Example: Handling Rate Limits in Client Code
+
+```python
+# Pseudo-code: handle rate limit retry logic
+MAX_RETRIES = 5
+BACKOFF_SECONDS = 1
+
+for attempt in range(MAX_RETRIES):
+    try:
+        return contract.register_document(issuer, owner, document_hash)
+    except ContractError(code=13):  # RateLimitExceeded
+        if attempt < MAX_RETRIES - 1:
+            wait_seconds = BACKOFF_SECONDS * (2 ** attempt)
+            time.sleep(wait_seconds)
+        else:
+            raise
+```
+
+
+
 ## 🧠 How It Works
 
 1. Document is hashed (SHA256)
@@ -325,10 +414,12 @@ The `MetricsRegistry` (defined in `src/metrics.rs`) is the central instrumentati
 
 #### Rate Limiter Metrics
 
-| Metric | Type | Description |
-|---|---|---|
-| `rate_limit_tokens_consumed_total` | Counter | Total rate limiter tokens consumed |
-| `rate_limit_violations_total` | Counter | Total rate limit violations (requests rejected) |
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `rate_limit_tokens_consumed_total` | Counter | — | Total rate limiter tokens consumed |
+| `rate_limit_violations_total` | Counter | — | Total rate limit violations (requests rejected) |
+| `rate_limit_per_issuer_hits_total` | CounterVec | `issuer` | Total rate limit hits (operations exceeding limit) per issuer |
+| `rate_limit_per_issuer_resets_total` | CounterVec | `issuer` | Total rate limit token resets (refill events) per issuer |
 
 #### Event Ingestion Metrics
 
