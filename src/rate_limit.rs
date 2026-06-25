@@ -1,8 +1,5 @@
-use std::num::NonZeroU32;
-use std::prelude::v1::*;
-use std::sync::Arc;
-
-use governor::{Quota, RateLimiter};
+use governor::{clock::{Clock, QuantaClock}, Quota, RateLimiter};
+use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use crate::metrics::MetricsRegistry;
 
@@ -72,9 +69,54 @@ pub fn build_rate_limiter(per_second: u32, burst: u32) -> DefaultRateLimiter {
     RateLimiter::direct(quota)
 }
 
+#[derive(Debug)]
+pub struct StellarRateLimiter {
+    inner: DefaultRateLimiter,
+}
+
+impl StellarRateLimiter {
+    pub fn new(per_second: u32, burst: u32) -> Self {
+        Self {
+            inner: build_rate_limiter(per_second, burst),
+        }
+    }
+
+    pub fn try_acquire(&self) -> bool {
+        self.inner.check().is_ok()
+    }
+
+    pub async fn acquire(&self) {
+        loop {
+            match self.inner.check() {
+                Ok(()) => return,
+                Err(negative) => {
+                    let delay = negative.wait_time_from(QuantaClock::default().now());
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    pub fn wait_time(&self) -> Option<Duration> {
+        self.inner
+            .check()
+            .err()
+            .map(|negative| negative.wait_time_from(QuantaClock::default().now()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_limiter_allows_burst_within_configured_limit() {
+        let limiter = StellarRateLimiter::new(1, 2);
+
+        assert!(limiter.try_acquire());
+        assert!(limiter.try_acquire());
+        assert!(!limiter.try_acquire());
+    }
 
     #[test]
     fn metrics_rate_limiter_consumes_token_on_check() {
