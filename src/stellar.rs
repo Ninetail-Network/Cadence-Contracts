@@ -158,6 +158,8 @@ pub struct VerificationResult {
     pub status: VerificationStatus,
     pub transaction_id: Option<String>,
     pub timestamp: Option<i64>,
+    /// HTTP status code if the last error was an HTTP response error
+    pub last_http_status: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -315,7 +317,25 @@ impl StellarClient {
     }
 
     async fn execute_verify_hash_with_retry(&self, hash: &str) -> StellarResult<VerificationResult> {
-        Ok(self.verify_hash(hash).await)
+        let result = self.verify_hash(hash).await;
+        match result.status {
+            VerificationStatus::ConfirmedMatch | VerificationStatus::NoMatch => Ok(result),
+            VerificationStatus::NetworkError | VerificationStatus::MalformedResponse => {
+                let reason = match result.last_http_status {
+                    Some(status) => format!("HTTP {}", status),
+                    None => format!("verification returned {:?}", result.status),
+                };
+                Err(StellarError::RetryExhausted {
+                    operation: "verify_hash",
+                    attempts: self.max_retries + 1,
+                    retries_attempted: self.max_retries,
+                    final_error: Box::new(StellarError::Request {
+                        url: self.horizon_url.clone(),
+                        reason,
+                    }),
+                })
+            }
+        }
     }
 
     fn retry_delay(&self, attempt: u32) -> Duration {
@@ -349,6 +369,7 @@ impl StellarClient {
     pub async fn verify_hash(&self, hash: &str) -> VerificationResult {
         let overall_start = MetricsRegistry::start_timer();
         let mut last_status = VerificationStatus::NoMatch;
+        let mut last_http_status: Option<u16> = None;
 
         for attempt in 0..=self.max_retries {
             if attempt > 0 {
@@ -388,6 +409,7 @@ impl StellarClient {
                                     status: VerificationStatus::ConfirmedMatch,
                                     transaction_id: Some(record.transaction_id),
                                     timestamp: Some(record.timestamp),
+                                    last_http_status: None,
                                 };
                             }
                             Ok(None) => {
@@ -400,8 +422,16 @@ impl StellarClient {
                             }
                         }
                     } else {
-                        last_status = VerificationStatus::NetworkError;
-                        // HTTP error — continue retry
+                        let status = resp.status().as_u16();
+                        if is_retryable_status(status) {
+                            last_status = VerificationStatus::NetworkError;
+                            last_http_status = Some(status);
+                            // HTTP error — continue retry
+                        } else {
+                            last_status = VerificationStatus::NoMatch;
+                            last_http_status = Some(status);
+                            break; // non-retryable — don't retry
+                        }
                     }
                 }
                 Err(_) => {
@@ -422,6 +452,7 @@ impl StellarClient {
             status: last_status,
             transaction_id: None,
             timestamp: None,
+            last_http_status,
         }
     }
 
@@ -849,7 +880,9 @@ mod tests {
             "_embedded": {
                 "records": [
                     {
-                        "hash": "transaction-id",
+                        "id": "transaction-id",
+                        "memo": "document-hash",
+                        "memo_type": "text",
                         "created_at": "2024-01-01T00:00:00Z"
                     }
                 ]
@@ -866,6 +899,7 @@ mod tests {
             .and(path("/transactions"))
             .and(query_param("memo", hash))
             .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(2)
             .expect(2)
             .mount(&server)
             .await;
@@ -880,7 +914,7 @@ mod tests {
         let client = StellarClient::with_config(&server.uri(), test_config());
         let result = client.verify_hash_with_retry(hash).await.unwrap();
 
-        assert!(result.verified);
+        assert!(result.verified());
         assert_eq!(result.transaction_id.as_deref(), Some("transaction-id"));
         assert_eq!(result.timestamp, Some(1_704_067_200));
         assert_eq!(client.circuit_breaker_metrics().successful_calls, 1);
@@ -935,7 +969,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/transactions"))
             .and(query_param("memo", hash))
-            .respond_with(ResponseTemplate::new(500))
+            .respond_with(ResponseTemplate::new(503))
             .expect(1)
             .mount(&server)
             .await;
@@ -971,6 +1005,7 @@ mod tests {
             .and(path("/transactions"))
             .and(query_param("memo", hash))
             .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
             .expect(1)
             .mount(&server)
             .await;
@@ -987,7 +1022,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(15)).await;
         let result = client.verify_hash_with_retry(hash).await.unwrap();
 
-        assert!(result.verified);
+        assert!(result.verified());
         assert_eq!(client.circuit_state(), CircuitState::Closed);
         assert_eq!(client.circuit_breaker_metrics().recoveries, 1);
         assert_eq!(client.circuit_breaker_metrics().half_open_successes, 1);
@@ -1041,6 +1076,7 @@ mod tests {
             status: VerificationStatus::ConfirmedMatch,
             transaction_id: Some("tx123".into()),
             timestamp: Some(12345),
+            last_http_status: None,
         };
         assert!(confirmed.verified());
 
@@ -1048,6 +1084,7 @@ mod tests {
             status: VerificationStatus::NoMatch,
             transaction_id: None,
             timestamp: None,
+            last_http_status: None,
         };
         assert!(!no_match.verified());
     }
