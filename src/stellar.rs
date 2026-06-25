@@ -1,8 +1,3 @@
-use rand::Rng;
-use std::prelude::v1::*;
-use std::sync::Arc;
-use std::time::Duration;
-
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -18,14 +13,14 @@ use thiserror::Error;
 
 use crate::{cache::CacheKey, config::AppConfig, rate_limit::StellarRateLimiter};
 
+use crate::metrics::MetricsRegistry;
+
 const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 100;
 const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 10_000;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_FAILURE_THRESHOLD: u32 = 5;
 const DEFAULT_OPEN_DURATION_MS: u64 = 30_000;
 const DEFAULT_HALF_OPEN_MAX_CALLS: u32 = 1;
-use crate::cache::CacheKey;
-use crate::metrics::MetricsRegistry;
 
 #[derive(Clone)]
 pub struct StellarClient {
@@ -33,6 +28,8 @@ pub struct StellarClient {
     http_client: reqwest::Client,
     rate_limiter: Arc<StellarRateLimiter>,
     circuit_breaker: Arc<CircuitBreaker>,
+    max_retries: u32,
+    metrics: Option<Arc<MetricsRegistry>>,
     config: StellarClientConfig,
 }
 
@@ -91,8 +88,8 @@ pub enum StellarError {
         state: CircuitState,
         retry_after: Duration,
     },
-    #[error("stellar request to {url} failed: {source}")]
-    Request { url: String, source: String },
+    #[error("stellar request to {url} failed: {reason}")]
+    Request { url: String, reason: String },
     #[error("stellar request to {url} timed out after {timeout:?}")]
     Timeout { url: String, timeout: Duration },
     #[error("stellar horizon returned HTTP {status} for {url}: {body}")]
@@ -107,7 +104,7 @@ pub enum StellarError {
         url: String,
         body: String,
     },
-    #[error("stellar horizon response for {url} could not be parsed: {0}. Body: {1}")]
+    #[error("stellar horizon response for {url} could not be parsed: {source}. Body: {body}")]
     ResponseParse {
         url: String,
         body: String,
@@ -122,8 +119,6 @@ pub enum StellarError {
         retries_attempted: u32,
         final_error: Box<StellarError>,
     },
-    max_retries: u32,
-    metrics: Option<Arc<MetricsRegistry>>,
 }
 
 impl std::fmt::Debug for StellarClient {
@@ -137,7 +132,6 @@ impl std::fmt::Debug for StellarClient {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 /// Categorised outcome of a Stellar Horizon verification.
 ///
 /// Distinguishes the four states required by the acceptance criteria:
@@ -229,17 +223,14 @@ impl StellarClient {
                 config.rate_limit_burst,
             )),
             circuit_breaker: Arc::new(CircuitBreaker::new(config.circuit_breaker.clone())),
+            max_retries: config.retry.max_retries,
+            metrics: None,
             config,
         }
     }
 
     pub fn config(&self) -> &StellarClientConfig {
         &self.config
-            horizon_url: horizon_url.to_string(),
-            http_client: reqwest::Client::new(),
-            max_retries: 3,
-            metrics: None,
-        }
     }
 
     /// Set the maximum number of retries for `verify_hash`.
@@ -299,7 +290,7 @@ impl StellarClient {
                     }
                     last_error = Some(StellarError::Request {
                         url: self.horizon_url.clone(),
-                        source: "connection check returned a non-success response".to_string(),
+                        reason: "connection check returned a non-success response".to_string(),
                     });
                     sleep(self.retry_delay(attempt)).await;
                 }
@@ -312,69 +303,9 @@ impl StellarClient {
             retries_attempted: self.config.retry.max_retries,
             final_error: Box::new(last_error.unwrap_or_else(|| StellarError::Request {
                 url: self.horizon_url.clone(),
-                source: "connection check failed".to_string(),
+                reason: "connection check failed".to_string(),
             })),
         })
-    }
-
-    pub async fn verify_hash(&self, hash: &str) -> StellarResult<VerificationResult> {
-        self.rate_limiter.acquire().await;
-        let url = format!("{}/transactions?memo={}", self.horizon_url, hash);
-        let resp = self.http_client.get(&url).send().await.map_err(|source| {
-            if source.is_timeout() {
-                StellarError::Timeout {
-                    url: url.clone(),
-                    timeout: self.config.request_timeout,
-                }
-            } else {
-                StellarError::Request {
-                    url: url.clone(),
-                    source: source.to_string(),
-                }
-            }
-        })?;
-
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-
-        if status.is_success() {
-            let parsed: HorizonTransactionsResponse = serde_json::from_str(&body).map_err(|source| {
-                StellarError::ResponseParse {
-                    url: url.clone(),
-                    body: truncate_body(&body),
-                    source,
-                }
-            })?;
-            let record = parsed.embedded.records.into_iter().next();
-
-            match record {
-                Some(record) => Ok(VerificationResult {
-                    verified: true,
-                    transaction_id: record.hash.filter(|value| !value.is_empty()),
-                    timestamp: record
-                        .created_at
-                        .as_deref()
-                        .and_then(parse_horizon_timestamp),
-                }),
-                None => Ok(VerificationResult {
-                    verified: false,
-                    transaction_id: None,
-                    timestamp: None,
-                }),
-            }
-        } else if is_retryable_status(status.as_u16()) {
-            Err(StellarError::RetryableHttpStatus {
-                status: status.as_u16(),
-                url,
-                body: truncate_body(&body),
-            })
-        } else {
-            Err(StellarError::NonRetryableHttpStatus {
-                status: status.as_u16(),
-                url,
-                body: truncate_body(&body),
-            })
-        }
     }
 
     pub async fn verify_hash_with_retry(&self, hash: &str) -> StellarResult<VerificationResult> {
@@ -384,37 +315,7 @@ impl StellarClient {
     }
 
     async fn execute_verify_hash_with_retry(&self, hash: &str) -> StellarResult<VerificationResult> {
-        let max_attempts = self.config.retry.max_retries.saturating_add(1);
-        let mut last_error = None;
-        let mut attempts_made = 0;
-
-        for attempt in 0..max_attempts {
-            attempts_made = attempt + 1;
-            match self.verify_hash(hash).await {
-                Ok(result) => return Ok(result),
-                Err(err) if err.is_retryable() && attempt + 1 < max_attempts => {
-                    last_error = Some(err);
-                    sleep(self.retry_delay(attempt)).await;
-                }
-                Err(err) => {
-                    last_error = Some(err);
-                    break;
-                }
-            }
-        }
-
-        let final_error = last_error.unwrap_or_else(|| StellarError::Request {
-            url: format!("{}/transactions?memo={}", self.horizon_url, hash),
-            source: "verification failed without a recorded error".to_string(),
-        });
-        let retries_attempted = attempts_made.saturating_sub(1);
-
-        Err(StellarError::RetryExhausted {
-            operation: "verify_hash",
-            attempts: attempts_made,
-            retries_attempted,
-            final_error: Box::new(final_error),
-        })
+        Ok(self.verify_hash(hash).await)
     }
 
     fn retry_delay(&self, attempt: u32) -> Duration {
@@ -433,7 +334,6 @@ impl StellarClient {
         }
     }
 
-    pub async fn anchor_transfer(&self, _transfer_hash: &str, _memo: &str) -> StellarResult<()> {
     /// Verify a document hash against Stellar Horizon with retries.
     ///
     /// Queries `GET /transactions?memo={hash}`, parses the response, and:
@@ -895,8 +795,12 @@ fn truncate_body(body: &str) -> String {
 }
 
 fn jittered_delay(max_delay: Duration) -> Duration {
-    let millis = (max_delay.as_secs_f64() * 1000.0 * rand::thread_rng().gen::<f64>()).round()
-        as u64;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let fraction = nanos as f64 / 1_000_000_000.0;
+    let millis = (max_delay.as_secs_f64() * 1000.0 * fraction).round() as u64;
     Duration::from_millis(millis)
 }
 
@@ -1108,8 +1012,7 @@ mod tests {
         assert_eq!(client.retry_delay(1), Duration::from_millis(200));
         assert_eq!(client.retry_delay(2), Duration::from_millis(400));
     }
-#[cfg(test)]
-mod tests {
+
     use super::*;
 
     #[test]

@@ -9,9 +9,6 @@ extern crate std;
 pub mod cache;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod config;
-#[cfg(not(target_arch = "wasm32"))]
-#[macro_use]
-extern crate std;
 
 pub mod error;
 #[cfg(not(target_arch = "wasm32"))]

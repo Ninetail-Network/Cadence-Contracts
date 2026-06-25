@@ -1,16 +1,12 @@
 use anyhow::Result;
 use redis::{aio::ConnectionManager, AsyncCommands};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, string::{String, ToString}, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
-use std::collections::HashMap;
-use std::prelude::v1::*;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use anyhow::Result;
-use redis::aio::ConnectionManager;
-use redis::AsyncCommands;
-use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    prelude::v1::*,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::sync::RwLock;
 
 use crate::metrics::MetricsRegistry;
@@ -154,7 +150,7 @@ impl RedisCache {
     async fn check_connection(&self) -> bool {
         let mut conn = self.connection.clone();
         redis::cmd("PING")
-            .query_async::<String>(&mut conn)
+            .query_async::<ConnectionManager, String>(&mut conn)
             .await
             .is_ok()
     }

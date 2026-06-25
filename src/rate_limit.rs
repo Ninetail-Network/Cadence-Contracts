@@ -1,10 +1,5 @@
-use governor::{clock::{Clock, MonotonicClock}, Quota, RateLimiter};
-use std::{num::NonZeroU32, time::Duration};
-use std::num::NonZeroU32;
-use std::prelude::v1::*;
-use std::sync::Arc;
-
-use governor::{Quota, RateLimiter};
+use governor::{clock::{Clock, QuantaClock}, Quota, RateLimiter};
+use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use crate::metrics::MetricsRegistry;
 
@@ -12,7 +7,6 @@ use crate::metrics::MetricsRegistry;
 pub type DefaultRateLimiter = RateLimiter<
     governor::state::NotKeyed,
     governor::state::InMemoryState,
-    MonotonicClock,
     governor::clock::QuantaClock,
 >;
 
@@ -96,7 +90,7 @@ impl StellarRateLimiter {
             match self.inner.check() {
                 Ok(()) => return,
                 Err(negative) => {
-                    let delay = negative.wait_time_from(MonotonicClock {}.now());
+                    let delay = negative.wait_time_from(QuantaClock::default().now());
                     tokio::time::sleep(delay).await;
                 }
             }
@@ -107,7 +101,7 @@ impl StellarRateLimiter {
         self.inner
             .check()
             .err()
-            .map(|negative| negative.wait_time_from(MonotonicClock {}.now()))
+            .map(|negative| negative.wait_time_from(QuantaClock::default().now()))
     }
 }
 
@@ -122,9 +116,7 @@ mod tests {
         assert!(limiter.try_acquire());
         assert!(limiter.try_acquire());
         assert!(!limiter.try_acquire());
-#[cfg(test)]
-mod tests {
-    use super::*;
+    }
 
     #[test]
     fn metrics_rate_limiter_consumes_token_on_check() {
