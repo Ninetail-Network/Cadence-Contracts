@@ -16,6 +16,7 @@ use crate::metrics::MetricsRegistry;
 pub enum CacheKey {
     Verification(String),
     Config(String),
+    Events(String),
 }
 
 impl CacheKey {
@@ -28,6 +29,7 @@ impl CacheKey {
         match self {
             CacheKey::Verification(hash) => format!("verification:{}", hash),
             CacheKey::Config(key) => format!("config:{}", key),
+            CacheKey::Events(hash) => format!("events:{}", hash),
         }
     }
 }
@@ -418,5 +420,31 @@ mod tests {
 
         let output = metrics.render();
         assert!(output.contains("cache_serialization_failures_total"));
+    }
+
+    #[tokio::test]
+    async fn event_cache_stores_and_retrieves_events() {
+        let cache = CacheBackend::InMemory(InMemoryCache::new());
+        let key = CacheKey::Events("doc-hash-1".to_string());
+        let events = vec!["{\"seq\":1}", "{\"seq\":2}"];
+        let serialized = serde_json::to_string(&events).unwrap();
+
+        cache.set_raw(&key, &serialized, 60).await.unwrap();
+        let retrieved: Option<Vec<serde_json::Value>> = cache.get(&key).await.unwrap();
+
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn event_cache_events_namespace_does_not_collide() {
+        let cache = CacheBackend::InMemory(InMemoryCache::new());
+        let v_key = CacheKey::Verification("x".to_string());
+        let e_key = CacheKey::Events("x".to_string());
+
+        cache.set_raw(&v_key, "verification_val", 60).await.unwrap();
+        cache.set_raw(&e_key, "events_val", 60).await.unwrap();
+        assert_eq!(cache.get_raw(&v_key).await.unwrap(), Some("verification_val".to_string()));
+        assert_eq!(cache.get_raw(&e_key).await.unwrap(), Some("events_val".to_string()));
     }
 }
