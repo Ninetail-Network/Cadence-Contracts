@@ -154,7 +154,7 @@ impl AppConfig {
         };
         let webhook_secret = env::var("WEBHOOK_SECRET").ok();
 
-        let rate_limit_per_second_raw = get_env_or_default("RATE_LIMIT_PER_SECOND", "10");
+        let rate_limit_per_second_raw = get_env_or_default("RATE_LIMIT_PER_SECOND", "100");
         let rate_limit_burst_raw =
             get_env_or_default("RATE_LIMIT_BURST", &rate_limit_per_second_raw);
 
