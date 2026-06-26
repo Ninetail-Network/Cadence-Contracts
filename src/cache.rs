@@ -1,12 +1,12 @@
-use std::collections::HashMap;
-use std::prelude::v1::*;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use anyhow::Result;
-use redis::aio::ConnectionManager;
-use redis::AsyncCommands;
+use redis::{aio::ConnectionManager, AsyncCommands};
 use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    prelude::v1::*,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::sync::RwLock;
 
 use crate::metrics::MetricsRegistry;
@@ -16,13 +16,20 @@ use crate::metrics::MetricsRegistry;
 pub enum CacheKey {
     Verification(String),
     Config(String),
+    Events(String),
 }
 
 impl CacheKey {
+    /// Construct a `Verification` key with a normalized (lowercase, trimmed) hash.
+    pub fn verification(hash: &str) -> Self {
+        CacheKey::Verification(hash.trim().to_lowercase())
+    }
+
     pub fn as_string(&self) -> String {
         match self {
             CacheKey::Verification(hash) => format!("verification:{}", hash),
             CacheKey::Config(key) => format!("config:{}", key),
+            CacheKey::Events(hash) => format!("events:{}", hash),
         }
     }
 }
@@ -145,7 +152,7 @@ impl RedisCache {
     async fn check_connection(&self) -> bool {
         let mut conn = self.connection.clone();
         redis::cmd("PING")
-            .query_async::<_, String>(&mut conn)
+            .query_async::<ConnectionManager, String>(&mut conn)
             .await
             .is_ok()
     }
@@ -320,6 +327,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verification_key_normalizes_case() {
+        let lower = CacheKey::verification("abc");
+        let upper = CacheKey::verification("ABC");
+        assert_eq!(lower.as_string(), upper.as_string());
+    }
+
+    #[tokio::test]
     async fn different_namespaces_do_not_collide() {
         let cache = CacheBackend::InMemory(InMemoryCache::new());
         let v_key = CacheKey::Verification("same".to_string());
@@ -406,5 +420,31 @@ mod tests {
 
         let output = metrics.render();
         assert!(output.contains("cache_serialization_failures_total"));
+    }
+
+    #[tokio::test]
+    async fn event_cache_stores_and_retrieves_events() {
+        let cache = CacheBackend::InMemory(InMemoryCache::new());
+        let key = CacheKey::Events("doc-hash-1".to_string());
+        let events = vec!["{\"seq\":1}", "{\"seq\":2}"];
+        let serialized = serde_json::to_string(&events).unwrap();
+
+        cache.set_raw(&key, &serialized, 60).await.unwrap();
+        let retrieved: Option<Vec<serde_json::Value>> = cache.get(&key).await.unwrap();
+
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn event_cache_events_namespace_does_not_collide() {
+        let cache = CacheBackend::InMemory(InMemoryCache::new());
+        let v_key = CacheKey::Verification("x".to_string());
+        let e_key = CacheKey::Events("x".to_string());
+
+        cache.set_raw(&v_key, "verification_val", 60).await.unwrap();
+        cache.set_raw(&e_key, "events_val", 60).await.unwrap();
+        assert_eq!(cache.get_raw(&v_key).await.unwrap(), Some("verification_val".to_string()));
+        assert_eq!(cache.get_raw(&e_key).await.unwrap(), Some("events_val".to_string()));
     }
 }

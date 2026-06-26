@@ -5,6 +5,8 @@ pub enum ValidationError {
     WrongLength { expected: usize, actual: usize },
     InvalidCharacter { position: usize, character: char },
     EmptyHash,
+    /// Hash algorithm is not supported for contract submission (only SHA-256 is accepted).
+    UnsupportedAlgorithm,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -26,6 +28,51 @@ impl HashValidator {
 
     pub fn validate_sha512(hash: &str) -> Result<(), ValidationError> {
         Self::validate_with_length(hash, 128)
+    }
+
+    /// Validate that a hash is a canonical SHA-256 hex string suitable for
+    /// contract submission. SHA-512 and all other lengths are explicitly rejected.
+    ///
+    /// Returns the normalized (lowercase, trimmed) hex string on success.
+    pub fn validate_for_contract(hash: &str) -> Result<String, ValidationError> {
+        let normalized = Self::normalize(hash);
+
+        // Reject SHA-512 explicitly before falling through to the length check.
+        if normalized.len() == 128 {
+            return Err(ValidationError::UnsupportedAlgorithm);
+        }
+
+        Self::validate_with_length(&normalized, 64)?;
+        Ok(normalized)
+    }
+
+    /// Convert a validated 64-character SHA-256 hex string to a 32-byte array.
+    ///
+    /// The input must already be a valid lowercase hex string of exactly 64 characters.
+    /// Call [`validate_for_contract`] first to ensure the input is well-formed.
+    pub fn hex_to_bytes32(hex: &str) -> Result<[u8; 32], ValidationError> {
+        Self::validate_with_length(hex, 64)?;
+        let mut bytes = [0u8; 32];
+        for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+            let hi = Self::hex_nibble(chunk[0]).ok_or(ValidationError::InvalidCharacter {
+                position: i * 2,
+                character: chunk[0] as char,
+            })?;
+            let lo = Self::hex_nibble(chunk[1]).ok_or(ValidationError::InvalidCharacter {
+                position: i * 2 + 1,
+                character: chunk[1] as char,
+            })?;
+            bytes[i] = (hi << 4) | lo;
+        }
+        Ok(bytes)
+    }
+
+    fn hex_nibble(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            _ => None,
+        }
     }
 
     fn validate_with_length(hash: &str, expected_len: usize) -> Result<(), ValidationError> {
@@ -158,5 +205,64 @@ mod tests {
     fn detect_algorithm_returns_none_for_other_lengths() {
         let algo = HashValidator::detect_algorithm("abc123");
         assert_eq!(algo, None);
+    }
+
+    // ── validate_for_contract ─────────────────────────────────────────
+
+    #[test]
+    fn validate_for_contract_accepts_sha256() {
+        let result = HashValidator::validate_for_contract(sample_sha256());
+        assert_eq!(result.unwrap(), sample_sha256());
+    }
+
+    #[test]
+    fn validate_for_contract_normalizes_uppercase_sha256() {
+        let upper = sample_sha256().to_uppercase();
+        let result = HashValidator::validate_for_contract(&upper);
+        assert_eq!(result.unwrap(), sample_sha256());
+    }
+
+    #[test]
+    fn validate_for_contract_rejects_sha512() {
+        match HashValidator::validate_for_contract(sample_sha512()) {
+            Err(ValidationError::UnsupportedAlgorithm) => {}
+            other => panic!("expected UnsupportedAlgorithm, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_for_contract_rejects_empty() {
+        assert!(matches!(
+            HashValidator::validate_for_contract(""),
+            Err(ValidationError::EmptyHash)
+        ));
+    }
+
+    // ── hex_to_bytes32 ────────────────────────────────────────────────
+
+    #[test]
+    fn hex_to_bytes32_converts_known_hash() {
+        // SHA-256 of empty string
+        let hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let bytes = HashValidator::hex_to_bytes32(hex).unwrap();
+        assert_eq!(bytes[0], 0xe3);
+        assert_eq!(bytes[1], 0xb0);
+        assert_eq!(bytes[31], 0x55);
+    }
+
+    #[test]
+    fn hex_to_bytes32_roundtrips_all_zero_hash() {
+        let hex = "0".repeat(64);
+        let bytes = HashValidator::hex_to_bytes32(&hex).unwrap();
+        assert_eq!(bytes, [0u8; 32]);
+    }
+
+    #[test]
+    fn hex_to_bytes32_rejects_wrong_length() {
+        let hex = "a".repeat(63);
+        assert!(matches!(
+            HashValidator::hex_to_bytes32(&hex),
+            Err(ValidationError::WrongLength { .. })
+        ));
     }
 }

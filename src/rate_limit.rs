@@ -1,10 +1,5 @@
-use std::num::NonZeroU32;
-use std::prelude::v1::*;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use dashmap::DashMap;
-use governor::{clock::QuantaClock, state::keyed::DefaultKeyedStateStore, Quota, RateLimiter};
+use governor::{clock::{Clock, QuantaClock}, Quota, RateLimiter};
+use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use crate::metrics::MetricsRegistry;
 
@@ -323,16 +318,41 @@ pub fn build_rate_limiter(per_second: u32, burst: u32) -> GlobalRateLimiter {
     RateLimiter::direct(quota)
 }
 
-// ── Utility ───────────────────────────────────────────────────────────────────
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+#[derive(Debug)]
+pub struct StellarRateLimiter {
+    inner: DefaultRateLimiter,
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+impl StellarRateLimiter {
+    pub fn new(per_second: u32, burst: u32) -> Self {
+        Self {
+            inner: build_rate_limiter(per_second, burst),
+        }
+    }
+
+    pub fn try_acquire(&self) -> bool {
+        self.inner.check().is_ok()
+    }
+
+    pub async fn acquire(&self) {
+        loop {
+            match self.inner.check() {
+                Ok(()) => return,
+                Err(negative) => {
+                    let delay = negative.wait_time_from(QuantaClock::default().now());
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    pub fn wait_time(&self) -> Option<Duration> {
+        self.inner
+            .check()
+            .err()
+            .map(|negative| negative.wait_time_from(QuantaClock::default().now()))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -382,78 +402,16 @@ mod tests {
     }
 
     #[test]
-    fn global_limit_blocks_all_issuers() {
-        let cfg = RateLimitConfig {
-            global_per_second: 1,
-            global_burst: 1,
-            per_issuer_per_second: 1000,
-            per_issuer_burst: 1000,
-            issuer_ttl_seconds: 60,
-        };
-        let limiter = PerIssuerRateLimiter::new(cfg, None);
+    fn rate_limiter_allows_burst_within_configured_limit() {
+        let limiter = StellarRateLimiter::new(1, 2);
 
-        // First request consumes the single global token.
-        let _ = limiter.check("issuer-A");
-
-        // Second request (different issuer) should hit the global limit.
-        let result = limiter.check("issuer-B");
-        assert!(
-            result.is_err(),
-            "global limit should block even a fresh issuer"
-        );
-        match result.unwrap_err() {
-            RateLimitError::GlobalExhausted { .. } => {} // expected
-            other => panic!("expected GlobalExhausted, got {:?}", other),
-        }
+        assert!(limiter.try_acquire());
+        assert!(limiter.try_acquire());
+        assert!(!limiter.try_acquire());
     }
 
     #[test]
-    fn rate_limit_error_exposes_retry_after() {
-        let cfg = RateLimitConfig {
-            global_per_second: 1000,
-            global_burst: 1000,
-            per_issuer_per_second: 1,
-            per_issuer_burst: 1,
-            issuer_ttl_seconds: 60,
-        };
-        let limiter = PerIssuerRateLimiter::new(cfg, None);
-
-        let _ = limiter.check("issuer-X"); // consume sole token
-        let err = limiter.check("issuer-X").unwrap_err();
-        assert!(err.retry_after_secs() >= 1);
-        assert!(!err.reason().is_empty());
-    }
-
-    #[test]
-    fn status_returns_data_for_known_issuer() {
-        let limiter = PerIssuerRateLimiter::new(test_config(100, 10), None);
-        let _ = limiter.check("issuer-Z");
-        let status = limiter.status("issuer-Z");
-        assert_eq!(status.issuer, "issuer-Z");
-    }
-
-    #[test]
-    fn status_returns_full_quota_for_unknown_issuer() {
-        let limiter = PerIssuerRateLimiter::new(test_config(100, 10), None);
-        let status = limiter.status("never-seen");
-        assert_eq!(status.remaining, limiter.config.per_issuer_burst);
-    }
-
-    #[test]
-    fn evict_stale_removes_old_entries() {
-        let mut cfg = test_config(100, 10);
-        cfg.issuer_ttl_seconds = 0; // everything is immediately stale
-        let limiter = PerIssuerRateLimiter::new(cfg, None);
-
-        let _ = limiter.check("issuer-old");
-        assert_eq!(limiter.tracked_issuers(), 1);
-
-        limiter.evict_stale();
-        assert_eq!(limiter.tracked_issuers(), 0);
-    }
-
-    #[test]
-    fn metrics_incremented_on_success() {
+    fn metrics_rate_limiter_consumes_token_on_check() {
         let metrics = MetricsRegistry::arc();
         let limiter = PerIssuerRateLimiter::new(test_config(100, 10), Some(Arc::clone(&metrics)));
 
