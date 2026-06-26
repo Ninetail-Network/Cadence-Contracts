@@ -1,7 +1,19 @@
-use governor::{clock::{Clock, QuantaClock}, Quota, RateLimiter};
-use std::{num::NonZeroU32, sync::Arc, time::Duration};
+use dashmap::DashMap;
+use governor::{
+    clock::{Clock, QuantaClock},
+    state::keyed::DefaultKeyedStateStore,
+    Quota, RateLimiter,
+};
+use std::{num::NonZeroU32, string::{String, ToString}, sync::Arc, time::Duration};
 
 use crate::metrics::MetricsRegistry;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 // ── Type aliases ─────────────────────────────────────────────────────────────
 
@@ -320,7 +332,7 @@ pub fn build_rate_limiter(per_second: u32, burst: u32) -> GlobalRateLimiter {
 
 #[derive(Debug)]
 pub struct StellarRateLimiter {
-    inner: DefaultRateLimiter,
+    inner: GlobalRateLimiter,
 }
 
 impl StellarRateLimiter {
