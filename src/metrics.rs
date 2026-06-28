@@ -52,6 +52,12 @@ pub struct MetricsRegistry {
     // ── Config validation metrics ──
     config_validation_failures: IntCounter,
     config_reload_total: IntCounter,
+
+    // ── Webhook delivery metrics ──
+    webhook_deliveries_total: IntCounterVec,
+    webhook_delivery_latency_seconds: HistogramVec,
+    webhook_dlq_depth: Gauge,
+    webhook_retries_total: IntCounter,
 }
 
 impl Default for MetricsRegistry {
@@ -199,6 +205,37 @@ impl MetricsRegistry {
         )
         .unwrap();
 
+        // ── Webhook delivery metrics ──
+        let webhook_deliveries_total = IntCounterVec::new(
+            Opts::new(
+                "webhook_deliveries_total",
+                "Total webhook delivery attempts by outcome",
+            ),
+            &["status"],
+        )
+        .unwrap();
+
+        let webhook_delivery_latency_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "webhook_delivery_latency_seconds",
+                "End-to-end webhook delivery latency in seconds",
+            ),
+            &["status"],
+        )
+        .unwrap();
+
+        let webhook_dlq_depth = Gauge::new(
+            "webhook_dlq_depth",
+            "Current number of entries in the webhook dead-letter queue",
+        )
+        .unwrap();
+
+        let webhook_retries_total = IntCounter::new(
+            "webhook_retries_total",
+            "Total webhook delivery retry attempts",
+        )
+        .unwrap();
+
         // ── Register everything ───────────────────────────────────────────
         for metric in [
             Box::new(request_count.clone()) as Box<dyn prometheus::core::Collector>,
@@ -222,6 +259,10 @@ impl MetricsRegistry {
             Box::new(event_backlog_size.clone()),
             Box::new(config_validation_failures.clone()),
             Box::new(config_reload_total.clone()),
+            Box::new(webhook_deliveries_total.clone()),
+            Box::new(webhook_delivery_latency_seconds.clone()),
+            Box::new(webhook_dlq_depth.clone()),
+            Box::new(webhook_retries_total.clone()),
         ] {
             registry.register(metric).unwrap();
         }
@@ -249,6 +290,10 @@ impl MetricsRegistry {
             event_backlog_size,
             config_validation_failures,
             config_reload_total,
+            webhook_deliveries_total,
+            webhook_delivery_latency_seconds,
+            webhook_dlq_depth,
+            webhook_retries_total,
         }
     }
 
@@ -383,6 +428,28 @@ impl MetricsRegistry {
         self.config_reload_total.inc();
     }
 
+    // ── Webhook delivery metrics ─────────────────────────────────────────
+
+    /// Record a completed delivery attempt (success or dead_lettered) with latency.
+    pub fn record_webhook_delivery(&self, status: &str, latency_secs: f64) {
+        self.webhook_deliveries_total
+            .with_label_values(&[status])
+            .inc();
+        self.webhook_delivery_latency_seconds
+            .with_label_values(&[status])
+            .observe(latency_secs);
+    }
+
+    /// Increment the webhook retry counter by one.
+    pub fn increment_webhook_retry(&self) {
+        self.webhook_retries_total.inc();
+    }
+
+    /// Set the dead-letter queue depth gauge.
+    pub fn set_webhook_dlq_depth(&self, depth: i64) {
+        self.webhook_dlq_depth.set(depth as f64);
+    }
+
     // ── Latency helper ───────────────────────────────────────────────────
 
     /// Start a timer for measuring operation latency.
@@ -447,6 +514,10 @@ mod tests {
         metrics.decrement_event_backlog();
         metrics.increment_config_validation_failure();
         metrics.increment_config_reload();
+        metrics.record_webhook_delivery("success", 0.05);
+        metrics.record_webhook_delivery("dead_lettered", 1.0);
+        metrics.increment_webhook_retry();
+        metrics.set_webhook_dlq_depth(3);
 
         let output = metrics.render();
         assert!(output.contains("requests_total"));
@@ -458,6 +529,10 @@ mod tests {
         assert!(output.contains("rate_limit_rejections_total"));
         assert!(output.contains("event_backlog_size"));
         assert!(output.contains("config_validation_failures_total"));
+        assert!(output.contains("webhook_deliveries_total"));
+        assert!(output.contains("webhook_delivery_latency_seconds"));
+        assert!(output.contains("webhook_dlq_depth"));
+        assert!(output.contains("webhook_retries_total"));
     }
 
     #[test]

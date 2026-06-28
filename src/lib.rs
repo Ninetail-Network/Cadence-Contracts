@@ -21,6 +21,8 @@ pub mod metrics;
 pub mod rate_limit;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod stellar;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod webhook;
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
     Symbol, Vec,

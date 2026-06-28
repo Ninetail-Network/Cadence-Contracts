@@ -51,6 +51,11 @@ pub struct AppConfig {
     pub log_level: String,
     pub webhook_urls: Vec<String>,
     pub webhook_secret: Option<String>,
+    pub webhook_max_retries: u32,
+    pub webhook_retry_base_delay_ms: u64,
+    pub webhook_retry_max_delay_ms: u64,
+    pub webhook_request_timeout_ms: u64,
+    pub webhook_jitter_enabled: bool,
     pub cache_verification_ttl: u64,
 }
 
@@ -98,6 +103,11 @@ impl fmt::Debug for AppConfig {
                 "webhook_secret",
                 &self.webhook_secret.as_deref().map(|_| "<redacted>"),
             )
+            .field("webhook_max_retries", &self.webhook_max_retries)
+            .field("webhook_retry_base_delay_ms", &self.webhook_retry_base_delay_ms)
+            .field("webhook_retry_max_delay_ms", &self.webhook_retry_max_delay_ms)
+            .field("webhook_request_timeout_ms", &self.webhook_request_timeout_ms)
+            .field("webhook_jitter_enabled", &self.webhook_jitter_enabled)
             .field("cache_verification_ttl", &self.cache_verification_ttl)
             .finish()
     }
@@ -153,6 +163,14 @@ impl AppConfig {
             }
         };
         let webhook_secret = env::var("WEBHOOK_SECRET").ok();
+        let webhook_max_retries_raw = get_env_or_default("WEBHOOK_MAX_RETRIES", "5");
+        let webhook_retry_base_delay_ms_raw =
+            get_env_or_default("WEBHOOK_RETRY_BASE_DELAY_MS", "200");
+        let webhook_retry_max_delay_ms_raw =
+            get_env_or_default("WEBHOOK_RETRY_MAX_DELAY_MS", "30000");
+        let webhook_request_timeout_ms_raw =
+            get_env_or_default("WEBHOOK_REQUEST_TIMEOUT_MS", "10000");
+        let webhook_jitter_raw = get_env_or_default("WEBHOOK_JITTER_ENABLED", "true");
 
         let rate_limit_per_second_raw = get_env_or_default("RATE_LIMIT_PER_SECOND", "100");
         let rate_limit_burst_raw =
@@ -465,6 +483,81 @@ impl AppConfig {
             );
         }
 
+        let webhook_max_retries: u32 = match webhook_max_retries_raw.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                errors.push(format!(
+                    "WEBHOOK_MAX_RETRIES must be a valid u32, got '{}'",
+                    webhook_max_retries_raw
+                ));
+                5
+            }
+        };
+
+        let webhook_retry_base_delay_ms: u64 = match webhook_retry_base_delay_ms_raw.parse() {
+            Ok(v) if v > 0 => v,
+            Ok(_) => {
+                errors.push("WEBHOOK_RETRY_BASE_DELAY_MS must be greater than 0".to_string());
+                200
+            }
+            Err(_) => {
+                errors.push(format!(
+                    "WEBHOOK_RETRY_BASE_DELAY_MS must be a valid u64, got '{}'",
+                    webhook_retry_base_delay_ms_raw
+                ));
+                200
+            }
+        };
+
+        let webhook_retry_max_delay_ms: u64 = match webhook_retry_max_delay_ms_raw.parse() {
+            Ok(v) if v > 0 => v,
+            Ok(_) => {
+                errors.push("WEBHOOK_RETRY_MAX_DELAY_MS must be greater than 0".to_string());
+                30_000
+            }
+            Err(_) => {
+                errors.push(format!(
+                    "WEBHOOK_RETRY_MAX_DELAY_MS must be a valid u64, got '{}'",
+                    webhook_retry_max_delay_ms_raw
+                ));
+                30_000
+            }
+        };
+
+        let webhook_request_timeout_ms: u64 = match webhook_request_timeout_ms_raw.parse() {
+            Ok(v) if v > 0 => v,
+            Ok(_) => {
+                errors.push("WEBHOOK_REQUEST_TIMEOUT_MS must be greater than 0".to_string());
+                10_000
+            }
+            Err(_) => {
+                errors.push(format!(
+                    "WEBHOOK_REQUEST_TIMEOUT_MS must be a valid u64, got '{}'",
+                    webhook_request_timeout_ms_raw
+                ));
+                10_000
+            }
+        };
+
+        let webhook_jitter_enabled = match webhook_jitter_raw.to_lowercase().as_str() {
+            "1" | "true" | "yes" | "y" => true,
+            "0" | "false" | "no" | "n" => false,
+            other => {
+                errors.push(format!(
+                    "WEBHOOK_JITTER_ENABLED must be a boolean, got '{}'",
+                    other
+                ));
+                true
+            }
+        };
+
+        if webhook_retry_max_delay_ms < webhook_retry_base_delay_ms {
+            errors.push(
+                "WEBHOOK_RETRY_MAX_DELAY_MS must be greater than or equal to WEBHOOK_RETRY_BASE_DELAY_MS"
+                    .to_string(),
+            );
+        }
+
         let webhook_urls: Vec<String> = webhook_urls_raw
             .split(',')
             .map(str::trim)
@@ -511,6 +604,11 @@ impl AppConfig {
             log_level,
             webhook_urls,
             webhook_secret,
+            webhook_max_retries,
+            webhook_retry_base_delay_ms,
+            webhook_retry_max_delay_ms,
+            webhook_request_timeout_ms,
+            webhook_jitter_enabled,
             cache_verification_ttl,
         })
     }
@@ -545,6 +643,11 @@ mod tests {
             "LOG_LEVEL",
             "WEBHOOK_URLS",
             "WEBHOOK_SECRET",
+            "WEBHOOK_MAX_RETRIES",
+            "WEBHOOK_RETRY_BASE_DELAY_MS",
+            "WEBHOOK_RETRY_MAX_DELAY_MS",
+            "WEBHOOK_REQUEST_TIMEOUT_MS",
+            "WEBHOOK_JITTER_ENABLED",
             "CACHE_VERIFICATION_TTL",
         ];
         for key in keys {
@@ -722,6 +825,11 @@ mod tests {
             log_level: "info".to_string(),
             webhook_urls: vec!["https://webhook.example.com".to_string()],
             webhook_secret: Some("another-secret".to_string()),
+            webhook_max_retries: 5,
+            webhook_retry_base_delay_ms: 200,
+            webhook_retry_max_delay_ms: 30_000,
+            webhook_request_timeout_ms: 10_000,
+            webhook_jitter_enabled: true,
             cache_verification_ttl: 3600,
         };
 
