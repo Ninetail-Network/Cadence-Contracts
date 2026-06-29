@@ -38,17 +38,19 @@ mod native {
 
     use axum::extract::State;
     use axum::response::IntoResponse;
-    use axum::routing::get;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use serde_json::json;
 
     use proofstell_contract::config::AppConfig;
     use proofstell_contract::metrics::MetricsRegistry;
+    use proofstell_contract::webhook::WebhookDispatcher;
 
     /// Shared application state, accessible by all axum handlers.
     #[derive(Clone)]
     struct AppState {
         metrics: Arc<MetricsRegistry>,
+        webhook: Arc<WebhookDispatcher>,
     }
 
     /// Build the axum router with all application routes.
@@ -56,6 +58,8 @@ mod native {
         Router::new()
             .route("/health", get(health_handler))
             .route("/metrics", get(metrics_handler))
+            .route("/webhooks/dlq", get(dlq_status_handler))
+            .route("/webhooks/dlq/drain", post(dlq_drain_handler))
             .with_state(state)
     }
 
@@ -67,6 +71,18 @@ mod native {
     /// `GET /metrics` — returns Prometheus text-format metrics.
     async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
         state.metrics.render()
+    }
+
+    /// `GET /webhooks/dlq` — returns the current DLQ depth.
+    async fn dlq_status_handler(State(state): State<AppState>) -> impl IntoResponse {
+        let depth = state.webhook.dlq_depth().await;
+        Json(json!({ "dlq_depth": depth }))
+    }
+
+    /// `POST /webhooks/dlq/drain` — drains and returns all DLQ entries for manual replay.
+    async fn dlq_drain_handler(State(state): State<AppState>) -> impl IntoResponse {
+        let entries = state.webhook.drain_dlq().await;
+        Json(json!({ "drained": entries.len(), "entries": entries }))
     }
 
     /// Bootstrap: load config, wire up services, and start the server.
@@ -89,10 +105,22 @@ mod native {
             "[proofstell]   rate_limit:          {}/s (burst {})",
             config.rate_limit_per_second, config.rate_limit_burst
         );
+        eprintln!(
+            "[proofstell]   webhooks:            {} url(s) configured (max_retries={})",
+            config.webhook_urls.len(),
+            config.webhook_max_retries,
+        );
+
+        // ── Webhook dispatcher ───────────────────────────────────────
+        let webhook = Arc::new(WebhookDispatcher::from_app_config(
+            &config,
+            Some(Arc::clone(&metrics)),
+        ));
 
         // ── Router ──────────────────────────────────────────────────
         let state = AppState {
             metrics: Arc::clone(&metrics),
+            webhook,
         };
         let app = build_router(state);
 

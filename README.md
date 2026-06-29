@@ -351,6 +351,15 @@ The `MetricsRegistry` (defined in `src/metrics.rs`) is the central instrumentati
 | `config_validation_failures_total` | Counter | Total configuration validation failures |
 | `config_reload_total` | Counter | Total configuration reloads attempted |
 
+#### Webhook Delivery Metrics
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `webhook_deliveries_total` | CounterVec | `status` (success/dead_lettered) | Total webhook delivery outcomes |
+| `webhook_delivery_latency_seconds` | HistogramVec | `status` | End-to-end delivery latency including all retries |
+| `webhook_dlq_depth` | Gauge | — | Current number of entries in the dead-letter queue |
+| `webhook_retries_total` | Counter | — | Total webhook retry attempts |
+
 #### Recommended Alerting Thresholds
 
 | Alert | Condition | Severity |
@@ -362,6 +371,8 @@ The `MetricsRegistry` (defined in `src/metrics.rs`) is the central instrumentati
 | Event backlog growing | `event_backlog_size > 1000` | Warning |
 | Config validation failures | `increase(config_validation_failures_total[5m]) > 0` | Critical |
 | High Horizon latency | `histogram_quantile(0.95, rate(horizon_latency_seconds_bucket[5m])) > 5` | Warning |
+| Webhook DLQ growing | `webhook_dlq_depth > 0` | Warning |
+| High webhook failure rate | `rate(webhook_deliveries_total{status="dead_lettered"}[5m]) > 0` | Critical |
 
 #### Running with Metrics
 
@@ -400,8 +411,13 @@ scrape_configs:
 | `STELLAR_CIRCUIT_BREAKER_OPEN_DURATION_MS` | `30000` | Milliseconds the circuit remains open before allowing a half-open probe |
 | `STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS` | `1` | Concurrent half-open probes allowed before recovery or reopening |
 | `LOG_LEVEL` | `info` | Log verbosity string |
-| `WEBHOOK_URLS` | empty | Comma-separated list of valid URLs |
-| `WEBHOOK_SECRET` | unset | Optional webhook signing secret |
+| `WEBHOOK_URLS` | empty | Comma-separated list of valid URLs to receive webhook events |
+| `WEBHOOK_SECRET` | unset | Optional shared secret sent as `X-Webhook-Secret` header |
+| `WEBHOOK_MAX_RETRIES` | `5` | Retry attempts after the initial webhook delivery fails |
+| `WEBHOOK_RETRY_BASE_DELAY_MS` | `200` | Initial exponential backoff delay in milliseconds; must be greater than `0` |
+| `WEBHOOK_RETRY_MAX_DELAY_MS` | `30000` | Maximum backoff delay in milliseconds; must be ≥ base delay |
+| `WEBHOOK_REQUEST_TIMEOUT_MS` | `10000` | Per-request webhook HTTP timeout in milliseconds; must be greater than `0` |
+| `WEBHOOK_JITTER_ENABLED` | `true` | Boolean; adds random jitter of up to 25 % of the capped delay |
 | `CACHE_VERIFICATION_TTL` | `3600` | Seconds before a cached verification result expires |
 
 Set `REDIS_URL` to a real Redis instance in production. The in-memory backend is suitable for local development and testing only.
@@ -416,6 +432,81 @@ The audit trail bridges Soroban contract activity and off-chain service records 
 - Contract metadata captures the transaction hash, ledger sequence, event index, and document hash so retries can be de-duplicated safely.
 
 Audit records should be retained for as long as the operator needs replay and forensic traceability. On-chain contract events remain the canonical source of truth, while the off-chain audit store keeps the derived trail for search, retention, and replay handling.
+
+---
+
+## 🔔 Webhook Delivery
+
+After an event is finalized, the service dispatches it asynchronously to every URL listed in `WEBHOOK_URLS`. External systems subscribe to these events to maintain up-to-date replicas of document state.
+
+### Event payload schema
+
+```json
+{
+  "event_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "event_type": "DocumentRegistered",
+  "idempotency_key": "contract:tx123:42:3:doc-1:DocumentRegistered",
+  "sequence": 42003,
+  "timestamp": "2026-06-28T12:00:00Z",
+  "aggregate_id": "doc-1",
+  "actor": "GDEX...",
+  "data": { "issuer": "GDEX...", "owner": "GBBB..." },
+  "metadata": {
+    "transaction_hash": "tx123",
+    "ledger_sequence": 42,
+    "event_index": 3,
+    "document_hash": "e3b0c4...",
+    "source": "contract"
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `event_id` | UUID v4 unique to this event record |
+| `event_type` | One of `DocumentRegistered`, `DocumentRevoked`, `DocumentVerified`, `DocumentAuthorizationFailed`, `DocumentOwnerChanged` |
+| `idempotency_key` | Stable token derived from transaction hash + event index. Use this to deduplicate retried deliveries. |
+| `sequence` | Monotonically increasing within an aggregate. For contract events: `ledger_sequence * 1000 + event_index`. |
+| `timestamp` | ISO-8601 UTC timestamp when the event was recorded |
+| `metadata` | Present for contract-origin events; contains `transaction_hash`, `ledger_sequence`, `event_index`, `document_hash` |
+
+### Request headers
+
+Each webhook HTTP POST includes the following headers:
+
+| Header | Value |
+|---|---|
+| `Content-Type` | `application/json` |
+| `X-Idempotency-Key` | The event's `idempotency_key` |
+| `X-Event-Id` | The event's `event_id` |
+| `X-Event-Type` | The event's `event_type` |
+| `X-Webhook-Secret` | Value of `WEBHOOK_SECRET` if configured |
+
+### Retry semantics
+
+Deliveries use exponential backoff with jitter:
+
+```
+delay(attempt) = min(base * 2^attempt, max) + random_jitter(0, delay/4)
+```
+
+- `base` is `WEBHOOK_RETRY_BASE_DELAY_MS` (default `200` ms)
+- `max` is `WEBHOOK_RETRY_MAX_DELAY_MS` (default `30 000` ms)
+- Jitter is drawn uniformly from `[0, capped_delay / 4)` using wall-clock sub-millisecond noise
+- Total attempts = `WEBHOOK_MAX_RETRIES + 1` (default 6 total)
+
+### Ordering guarantees
+
+URLs are contacted **sequentially in registration order**. An event is attempted against every URL regardless of individual failures — a URL that exhausts retries is dead-lettered without blocking delivery to subsequent URLs.
+
+### Dead-letter queue
+
+Failed deliveries (all retries exhausted) are moved to an in-memory bounded queue (max 10 000 entries). The queue is accessible via:
+
+- `GET /webhooks/dlq` — returns `{"dlq_depth": N}`
+- `POST /webhooks/dlq/drain` — drains and returns all entries: `{"drained": N, "entries": [...]}`
+
+Each dead-letter entry contains the original payload, target URL, attempt count, last error, and failure timestamp. Replaying drained entries is the operator's responsibility.
 
 ---
 
