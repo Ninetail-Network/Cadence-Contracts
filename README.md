@@ -1,5 +1,22 @@
 # Cadence Contracts (Soroban)
 
+This is the on-chain layer of **Cadence**, a Stellar-native platform where
+fans send creators anonymous messages, creators can respond by text or by
+having an AI voice agent (EchoCall) call the fan back, and both sides build
+a daily check-in streak (Pulse) that pays out rewards. Full project context
+lives in the [top-level README](../README.md) — this document covers only
+the smart contracts that make the platform trustworthy without a central
+authority holding anyone's funds or identity.
+
+These contracts exist so that:
+- A fan's **payment to unlock priority attention is never just handed to the
+  creator on faith** — it sits in escrow until the creator actually acts.
+- A user's **daily streak can't be faked or edited by a backend** — it's a
+  public, append-only record on Stellar that anyone can verify.
+- **Reward issuance is automatic and auditable** — streak milestones mint the
+  `VEIL` token directly, with no manual "here's your reward" step a backend
+  could get wrong or skip.
+
 Smart contracts that power **The Veil** (anonymous message escrow) and
 **Pulse** (daily streak ritual + reward token), written in Rust for
 [Soroban](https://soroban.stellar.org/), Stellar's smart contract platform.
