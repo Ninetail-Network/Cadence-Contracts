@@ -1,6 +1,6 @@
 ---
 name: upgrade-governance-design
-description: Design spec for contract upgrade mechanism, versioning, migration path, and governance for ProofStell Soroban contract (issue #29)
+description: Design spec for contract upgrade mechanism, versioning, migration path, and governance for Cadence Soroban contract (issue #29)
 metadata:
   type: project
 ---
@@ -11,7 +11,7 @@ metadata:
 
 ## Problem
 
-The ProofStell contract has no upgrade mechanism. Future changes to `DocumentRecord`, error types, or event formats would require redeploying to a new address, losing all historical state and forcing clients to migrate manually. There is no version signal for indexers to detect which contract version produced a given event.
+The Cadence contract has no upgrade mechanism. Future changes to `DocumentRecord`, error types, or event formats would require redeploying to a new address, losing all historical state and forcing clients to migrate manually. There is no version signal for indexers to detect which contract version produced a given event.
 
 ## Approach
 

@@ -1,4 +1,4 @@
-# ProofStell Contract Upgrade Governance
+# Cadence Contract Upgrade Governance
 
 This document defines the decision process for upgrading the ProofStell Soroban contract, classifying change types, and authorizing governance actions.
 

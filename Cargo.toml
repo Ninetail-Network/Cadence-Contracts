@@ -1,5 +1,5 @@
 [package]
-name = "proofstell_contract"
+name = "Cadence_contract"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,7 +7,7 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "proofstell_service"
+name = "Cadence_service"
 path = "src/main.rs"
 
 [dependencies]

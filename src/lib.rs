@@ -63,7 +63,7 @@ pub struct DocumentInfo {
 
 pub const MAX_BATCH_SIZE: u32 = 20;
 
-/// Enumeration of all error conditions that can occur within the ProofStell contract.
+/// Enumeration of all error conditions that can occur within the Cadence contract.
 ///
 /// Each variant maps to a unique numeric code for Soroban client interoperability,
 /// allowing callers to distinguish failure cases and implement appropriate recovery logic.
@@ -143,10 +143,10 @@ pub struct ContractUpgraded {
 }
 
 #[contract]
-pub struct ProofStellContract;
+pub struct CadenceContract;
 
 #[contractimpl]
-impl ProofStellContract {
+impl CadenceContract {
     /// Registers a new document on-chain, associating it with an issuer and owner.
     ///
     /// The issuer must authorize this call. Each document hash can only be registered once.
@@ -624,7 +624,7 @@ mod tests {
 
     fn setup() -> (
         Env,
-        ProofStellContractClient<'static>,
+        CadenceContractClient<'static>,
         Address,
         Address,
         BytesN<32>,
@@ -632,8 +632,8 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
 
-        let contract_id = env.register(ProofStellContract, ());
-        let client = ProofStellContractClient::new(&env, &contract_id);
+        let contract_id = env.register(CadenceContract, ());
+        let client = CadenceContractClient::new(&env, &contract_id);
         let issuer = Address::generate(&env);
         let owner = Address::generate(&env);
         let document_hash = BytesN::from_array(&env, &[7; 32]);

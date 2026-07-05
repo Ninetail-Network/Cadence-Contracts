@@ -1,6 +1,6 @@
 ---
 name: batch-operations-design
-description: Design spec for batch_register_documents and batch_revoke_documents on the ProofStell Soroban contract
+description: Design spec for batch_register_documents and batch_revoke_documents on the Cadence Soroban contract
 metadata:
   type: project
 ---

@@ -1,4 +1,4 @@
-//! ProofStell service binary entry point.
+//! Cadence service binary entry point.
 //!
 //! This binary starts an HTTP server that exposes:
 //!
@@ -42,9 +42,9 @@ mod native {
     use axum::{Json, Router};
     use serde_json::json;
 
-    use proofstell_contract::config::AppConfig;
-    use proofstell_contract::metrics::MetricsRegistry;
-    use proofstell_contract::webhook::WebhookDispatcher;
+    use Cadence_contract::config::AppConfig;
+    use Cadence_contract::metrics::MetricsRegistry;
+    use Cadence_contract::webhook::WebhookDispatcher;
 
     /// Shared application state, accessible by all axum handlers.
     #[derive(Clone)]
@@ -94,19 +94,19 @@ mod native {
         let config = AppConfig::from_env_with_metrics(Some(Arc::clone(&metrics)))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        eprintln!("[proofstell] Configuration loaded successfully");
-        eprintln!("[proofstell]   port:               {}", config.port);
+        eprintln!("[Cadence] Configuration loaded successfully");
+        eprintln!("[Cadence]   port:               {}", config.port);
         eprintln!(
-            "[proofstell]   stellar_horizon_url: {}",
+            "[Cadence]   stellar_horizon_url: {}",
             config.stellar_horizon_url
         );
-        eprintln!("[proofstell]   redis_url:           {}", config.redis_url);
+        eprintln!("[Cadence]   redis_url:           {}", config.redis_url);
         eprintln!(
-            "[proofstell]   rate_limit:          {}/s (burst {})",
+            "[Cadence]   rate_limit:          {}/s (burst {})",
             config.rate_limit_per_second, config.rate_limit_burst
         );
         eprintln!(
-            "[proofstell]   webhooks:            {} url(s) configured (max_retries={})",
+            "[Cadence]   webhooks:            {} url(s) configured (max_retries={})",
             config.webhook_urls.len(),
             config.webhook_max_retries,
         );
@@ -126,7 +126,7 @@ mod native {
 
         // ── Bind & serve ────────────────────────────────────────────
         let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-        eprintln!("[proofstell] Starting HTTP server on {addr}");
+        eprintln!("[Cadence] Starting HTTP server on {addr}");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, app).await?;
@@ -139,7 +139,7 @@ mod native {
 #[tokio::main]
 async fn main() {
     if let Err(e) = native::run().await {
-        eprintln!("[proofstell] Fatal error: {e:#}");
+        eprintln!("[Cadence] Fatal error: {e:#}");
         std::process::exit(1);
     }
 }
